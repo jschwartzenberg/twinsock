@@ -21,8 +21,15 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #endif
+#include <ctype.h>
 #include "packet.h"
 #include "twinsock.h"
+
+extern int GetTwinSockSetting(	char	*pchSection,
+			char	*pchItem,
+			char	*pchDefault,
+			char	*pchBuffer,
+			int	nChars);
 
 #define	MAX_STREAMS	256
 #define	WINDOW_SIZE	4
@@ -84,10 +91,7 @@ static unsigned long crc_32_tab[] = { /* CRC polynomial 0xedb88320 */
 
 #define UPDC32(octet, crc) (crc_32_tab[((crc) ^ (octet)) & 0xff] ^ ((crc) >> 8))
 
-static	short
-CalcCRC(data, size)
-char *data;
-int size;
+static	short CalcCRC(char *data, int size)
 {
 	unsigned long crc = 0xffff;
 
@@ -381,7 +385,7 @@ void	InitHead()
 	ppqList->idPacket = nOutSeq;
 	pkt = ppqList->pkt;
 	pkt->iPacketID = htons(nOutSeq);
-	nCRC = CalcCRC(pkt, ppqList->iPacketLen);
+	nCRC = CalcCRC((char *)pkt, ppqList->iPacketLen);
 	pkt->nCRC = htons(nCRC);
 	nOutSeq++;
 }
@@ -597,7 +601,7 @@ void	TransmitAck(short id)
 	pkt.nCRC = 0;
 	pkt.nType = htons((short) PT_Ack);
 	pkt.iPacketID = htons(id);
-	nCRC = CalcCRC(&pkt, sizeof(short) * 4);
+	nCRC = CalcCRC((char *)&pkt, sizeof(short) * 4);
 	pkt.nCRC = htons(nCRC);
 	TransmitData(&pkt, sizeof(short) * 4);
 }
@@ -665,7 +669,7 @@ void	ProcessData(void *pvData, int nDataLen)
 		{
 			nBytes = 0;
 			pkt.nCRC = 0;
-			if (CalcCRC(&pkt, iLen + sizeof(short) * 4) == nCRC)
+			if (CalcCRC((char *)&pkt, iLen + sizeof(short) * 4) == nCRC)
 			{
 				switch(pt)
 				{
@@ -936,4 +940,3 @@ ReInitPackets(void)
 	FlushQueue(&ppqList);
 	memset(aiStreams, 0, sizeof(aiStreams));
 }
-
