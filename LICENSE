@@ -1,3 +1,13 @@
+		   The Ultra TwinSock License
+		    Version 1, 6-June-1995
+
+As of June 6th, 1995, the software Ultra TwinSock will be licensed
+by the terms of "The TwinSock, TKERN, and IRC II for Windows License"
+listed below. However, the author, Misha Koshelev, has the right
+to license later version of Ultra TwinSock which do not rely
+on any or rely on little source code from TwinSock, if any are released, 
+under a different license.
+	
 	The TwinSock, TKERN and IRC II for Windows License
 		Version 1, 16-January-1995
 
@@ -41,12 +51,12 @@ Preamble:
   in the form of American Express Travellers Cheques or
   international money orders payable to Troy Rollo to:
 
-        Troy Rollo
-        Sycomp Pty Ltd
-        Level 4
-        1 James Place
-        North Sydney 2060
-        AUSTRALIA
+	Troy Rollo
+	Sycomp Pty Ltd
+	Level 4
+	1 James Place
+	North Sydney 2060
+	AUSTRALIA
 
   All money amounts are in United States Dollars.
 
@@ -59,11 +69,11 @@ This product is licensed under the following terms:
      i) for ircII, the license for ircII 2.6 for UNIX
 
      ii) for TwinSock, and for parts of TKERN which are included
-         in TKFMANGR.EXE, the GNU GENERAL PUBLIC LICENSE, Version 2
-         (Included herein as Schedule 1) shall apply to this software.
+	 in TKFMANGR.EXE, the GNU GENERAL PUBLIC LICENSE, Version 2
+	 (Included herein as Schedule 1) shall apply to this software.
 
      iii) For the remainder of TKERN, the GNU LIBRARY GENERAL PUBLIC
-          LICENSE, Version 2 (Included herein as Schedule 2)
+	  LICENSE, Version 2 (Included herein as Schedule 2)
 
   2. A license fee of $231.02 (Two hundred and thirty one dollars
      and two cents) per machine installed shall be payable by anybody
@@ -77,12 +87,12 @@ This product is licensed under the following terms:
      (b) a parent company of any company covered by (a)
 
 	 i)  For the purposes of this license, a parent company
-             is any company holding more than 20% of the shares
-             of the company by cash value.
+	     is any company holding more than 20% of the shares
+	     of the company by cash value.
 
-         ii) A parent company of any company covered by (b) is
-             itself considered to be a parent company, and thus
-             is also covered by (b)
+	 ii) A parent company of any company covered by (b) is
+	     itself considered to be a parent company, and thus
+	     is also covered by (b)
 
 	OR
 
@@ -99,12 +109,12 @@ This product is licensed under the following terms:
 	OR
 
      (f) a person living in the same residence as a person
-         covered by (e)
+	 covered by (e)
 
 	OR
 
      (g) a govornment or govornment department holding more
-         than 10% of the shares in a company covered by (a)
+	 than 10% of the shares in a company covered by (a)
 
   3. The software may not be transmitted over any communications
      service provided by a company named Citizens Utilities
@@ -124,21 +134,21 @@ This product is licensed under the following terms:
      (3) and (4) if
 
      (a) The user of the software witholds payment of all
-         bills received until the last day payable
+	 bills received until the last day payable
 
 	AND
 
      (b) The user submits, with each bill payment, a complaint
-         about Citizens Utilities toll charges on account
-         916/683-2400 between 15-December-1994 and 15-January-1995,
-         requesting that the full amount of those charges be
-         refunded
+	 about Citizens Utilities toll charges on account
+	 916/683-2400 between 15-December-1994 and 15-January-1995,
+	 requesting that the full amount of those charges be
+	 refunded
 
 	AND
 
      (c) The user request to pay each bill by credit card if they
-         posess any of the following cards: Visa, Mastercard,
-         American Express.
+	 posess any of the following cards: Visa, Mastercard,
+	 American Express.
 
   6. A person whose telephone service is provided by a company
      covered by (4), who switches to another provider within
@@ -166,7 +176,7 @@ SCHEDULE 1
 		       Version 2, June 1991
 
  Copyright (C) 1989, 1991 Free Software Foundation, Inc.
-                          675 Mass Ave, Cambridge, MA 02139, USA
+			  675 Mass Ave, Cambridge, MA 02139, USA
  Everyone is permitted to copy and distribute verbatim copies
  of this license document, but changing it is not allowed.
 
@@ -509,7 +519,7 @@ SCHEDULE 2
 		       Version 2, June 1991
 
  Copyright (C) 1991 Free Software Foundation, Inc.
-                    675 Mass Ave, Cambridge, MA 02139, USA
+		    675 Mass Ave, Cambridge, MA 02139, USA
  Everyone is permitted to copy and distribute verbatim copies
  of this license document, but changing it is not allowed.
 
