@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "twinsock.h"
 
 extern	HINSTANCE	hinst;
@@ -32,45 +33,79 @@ enum LineSpeed { B110, B300, B600, B1200, B2400, B4800, B9600,
 unsigned GetSpeedIndex(enum LineSpeed lsSpeed);
 
 void
+#ifdef __FLAT__
+InitComm(HANDLE idComm)
+#else
 InitComm(int	idComm)
+#endif
 {
 	DCB	dcb;
 	unsigned speed;
+	int	iFlowType;
+#ifdef __FLAT__
+	COMMTIMEOUTS cto;
+#endif
 
+	memset(&dcb, 0, sizeof(dcb));
+#ifdef __FLAT__
+	dcb.DCBlength = sizeof(dcb);
+	dcb.fDtrControl = GetConfigInt("fDtrControl",
+				iFlowType ? DTR_CONTROL_HANDSHAKE :
+				DTR_CONTROL_ENABLE);
+	dcb.fDsrSensitivity = GetConfigInt("fDsrSensitivity", 0);
+	dcb.fTXContinueOnXoff = GetConfigInt("fTXContinueOnXoff", TRUE);
+	dcb.fErrorChar = 0;
+	dcb.fRtsControl = GetConfigInt("fRtsControl",
+					iFlowType ? RTS_CONTROL_ENABLE :
+					RTS_CONTROL_HANDSHAKE);
+	dcb.fAbortOnError = GetConfigInt("fAbortOnError", FALSE);
+	dcb.wReserved = 0;
+	dcb.ErrorChar = 0;
+	dcb.wReserved1 = 0;
+#else
 	dcb.Id = idComm;
+	dcb.RlsTimeout = GetConfigInt("RlsTimeout", 0);
+	dcb.CtsTimeout = GetConfigInt("CtsTimeout", 0);
+	dcb.DsrTimeout = GetConfigInt("DsrTimeout", 1000);
+	dcb.PeChar = 0;
+	dcb.fChEvt = 0;
+	dcb.fDtrflow = GetConfigInt("fDtrFlow", (iFlowType == 1));
+	dcb.fRtsflow = GetConfigInt("fRtsFlow", (iFlowType == 0));
+	dcb.TxDelay = 0;
+	dcb.fDtrDisable = GetConfigInt("fDtrDisable", FALSE);
+	dcb.fRtsDisable = GetConfigInt("fRtsDisable", FALSE);
+	dcb.fPeChar = 0;
+	dcb.fDummy = 0;
+#endif
+	iFlowType = GetConfigInt("FlowType", 0);
 	speed = GetConfigInt("Speed", B19200);
 	dcb.BaudRate = GetSpeedIndex((enum LineSpeed) speed);
 	dcb.ByteSize = GetConfigInt("Databits", 8);
 	dcb.Parity = GetConfigInt("Parity", NOPARITY);
 	dcb.StopBits = GetConfigInt("StopBits", ONESTOPBIT);
-	dcb.RlsTimeout = GetConfigInt("RlsTimeout", 0);
-	dcb.CtsTimeout = GetConfigInt("CtsTimeout", 0);
-	dcb.DsrTimeout = GetConfigInt("DsrTimeout", 0);
 	dcb.fBinary = TRUE;
-	dcb.fRtsDisable = GetConfigInt("fRtsDisable", FALSE);
 	dcb.fParity = GetConfigInt("fParity", FALSE);
-	dcb.fOutxCtsFlow = GetConfigInt("OutxCtsFlow", TRUE);
-	dcb.fOutxDsrFlow = GetConfigInt("OutxDsrFlow", FALSE);
-	dcb.fDummy = 0;
-	dcb.fDtrDisable = GetConfigInt("fDtrDisable", FALSE);
-	dcb.fOutX = GetConfigInt("fOutX", TRUE);
+	dcb.fOutxCtsFlow = GetConfigInt("OutxCtsFlow", (iFlowType == 0));
+	dcb.fOutxDsrFlow = GetConfigInt("OutxDsrFlow", (iFlowType == 1));
+	dcb.fOutX = GetConfigInt("fOutX", FALSE);
 	dcb.fInX = GetConfigInt("fInX", FALSE);
-	dcb.fPeChar = 0;
 	dcb.fNull = 0;
-	dcb.fChEvt = 0;
-	dcb.fDtrflow = GetConfigInt("fDtrFlow", FALSE);
-	dcb.fRtsflow = GetConfigInt("fRtsFlow", FALSE);
 	dcb.fDummy2 = 0;
 	dcb.XonChar = '\021';
 	dcb.XoffChar = '\023';
 	dcb.XonLim = 100;
 	dcb.XoffLim = 900;
-	dcb.PeChar = 0;
 	dcb.EofChar = 0;
 	dcb.EvtChar = 0;
-	dcb.TxDelay = 0;
 
+#ifdef __FLAT__
+	memset(&cto, 0, sizeof(cto));
+	cto.ReadIntervalTimeout = 5;
+	SetCommState(idComm, &dcb);
+	SetCommTimeouts(idComm, &cto);
+#else
 	SetCommState(&dcb);
+#endif
 }
 
 static	struct
@@ -144,6 +179,10 @@ char	*apchStopBits[] =
 #define	CE_DATABITS	105
 #define	CE_PARITY	107
 #define	CE_STOPBITS	109
+#define	CE_CTSRTS	121
+#define	CE_DTRDSR	122
+#define	CE_NOFLOW	123
+#define	CE_BUFFER	130
 
 static	void
 FillCommsDialog(HWND hDlg)
@@ -171,18 +210,25 @@ FillCommsDialog(HWND hDlg)
 		sprintf(achTmp, "%d", i);
 		SendDlgItemMessage(hDlg, CE_DATABITS, CB_ADDSTRING, 0, (LPARAM) achTmp);
 	}
-	i = GetPrivateProfileInt("Config", "DataBits", 8, "TWINSOCK.INI");
+	i = GetConfigInt("DataBits", 8);
 	SendDlgItemMessage(hDlg, CE_DATABITS, CB_SETCURSEL, i - 5, 0);
 
 	for (i = 0; apchParities[i]; i++)
 		SendDlgItemMessage(hDlg, CE_PARITY, CB_ADDSTRING, 0, (LPARAM) apchParities[i]);
-	i = GetPrivateProfileInt("Config", "Parity", 0, "TWINSOCK.INI");
+	i = GetConfigInt("Parity", 0);
 	SendDlgItemMessage(hDlg, CE_PARITY, CB_SETCURSEL, i, 0);
 
 	for (i = 0; apchStopBits[i]; i++)
 		SendDlgItemMessage(hDlg, CE_STOPBITS, CB_ADDSTRING, 0, (LPARAM) apchStopBits[i]);
-	i = GetPrivateProfileInt("Config", "StopBits", 0, "TWINSOCK.INI");
+	i = GetConfigInt("StopBits", 0);
 	SendDlgItemMessage(hDlg, CE_STOPBITS, CB_SETCURSEL, i, 0);
+
+	i = GetConfigInt("FlowType", 0);
+	SendDlgItemMessage(hDlg, CE_CTSRTS + i, BM_SETCHECK, 1, 0);
+
+	i = GetConfigInt("BufferSize", 16384);
+	sprintf(achTmp, "%d", i);
+	SetDlgItemText(hDlg, CE_BUFFER, achTmp);
 }
 
 void
@@ -213,6 +259,17 @@ ReadCommsDialog(HWND hDlg)
 	i = SendDlgItemMessage(hDlg, CE_STOPBITS, CB_GETCURSEL, 0, 0);
 	sprintf(achTemp, "%d", i);
 	WritePrivateProfileString("Config", "StopBits", achTemp, "TWINSOCK.INI");
+
+	for (i = 0; i < 3; i++)
+		if (SendDlgItemMessage(hDlg, CE_CTSRTS + i, BM_GETCHECK, 0, 0))
+			break;
+	sprintf(achTemp, "%d", i);
+	WritePrivateProfileString("Config", "FlowType", achTemp, "TWINSOCK.INI");
+
+	GetDlgItemText(hDlg, CE_BUFFER, achTemp, sizeof(achTemp));
+	if (atoi(achTemp) <= 0)
+		strcpy(achTemp, "16384");
+	WritePrivateProfileString("Config", "BufferSize", achTemp, "TWINSOCK.INI");
 }
 
 #pragma argsused
@@ -239,6 +296,11 @@ CommsDlgProc(	HWND	hDlg,
 		case IDCANCEL:
 			EndDialog(hDlg, FALSE);
 			break;
+
+		case 3:
+			WinHelp(hDlg, "TWINSOCK.HLP", HELP_CONTENTS, 0);
+			break;
+
 		}
 		break;
 	}
@@ -301,6 +363,7 @@ DialDlgProc(	HWND	hDlg,
 		case IDCANCEL:
 			EndDialog(hDlg, FALSE);
 			break;
+
 
 		case DL_NUMBER:
 			EnableWindow(GetDlgItem(hDlg, IDOK),

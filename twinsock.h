@@ -26,13 +26,21 @@ void	FlushInput(void);
 void	DataReceived(void *pvData, int iLen);
 void	Shutdown(void);
 BOOL	CommsEdit(HWND hwndParent);
+#ifdef __FLAT__
+void	InitComm(HANDLE idComm);
+#else
 void	InitComm(int idComm);
+#endif
 BOOL	DialNumber(HWND hwndParent);
 void	ShowProtoInfo(HWND hwndParent);
 void	About(HWND hwndParent);
 void	TimeoutReceived(void);
 void	PacketTransmitData(void *pvData, int iDataLen, int iStream);
 void	ReInitPackets(void);
+
+#if defined(__FLAT__) && !defined(HTASK)
+#define HTASK int
+#endif
 
 #endif
 
@@ -70,6 +78,9 @@ enum Encoding
 	E_Explicit,
 };
 
+/* Functions marked as obsolete are now handled as side effects of
+ * other functions.
+ */
 enum	Functions
 {
 	FN_Init = 0,
@@ -78,11 +89,11 @@ enum	Functions
 	FN_Close,
 	FN_Connect,
 	FN_IOCtl,
-	FN_GetPeerName,
-	FN_GetSockName,
+	FN_GetPeerName,	/* Obsolete - handled by connect() */
+	FN_GetSockName,	/* Obsolete - handled by bind() */
 	FN_GetSockOpt,
 	FN_Listen,
-	FN_Select,
+	FN_Select,	/* Obsolete - handled internally */
 	FN_Send,
 	FN_SendTo,
 	FN_SetSockOpt,
@@ -130,6 +141,7 @@ struct	data
 	struct	data *pdNext;
 };
 
+#ifdef __DLL__
 struct	per_task
 {
 	HTASK			htask;
@@ -142,6 +154,7 @@ struct	per_task
 	struct	hostent		he;
 	struct	servent		se;
 	struct	protoent	pe;
+	char			achRevAddress[4];
 	char			achHostEnt[MAX_HOST_ENT];
 	char			*apchHostAlii[MAX_ALTERNATES];
 	char			*apchHostAddresses[MAX_ALTERNATES];
@@ -149,7 +162,31 @@ struct	per_task
 	char			*apchServAlii[MAX_ALTERNATES];
 	char			achProtoEnt[MAX_HOST_ENT];
 	char			*apchProtoAlii[MAX_ALTERNATES];
+	struct __tws_client	*pClient;
+	HWND			hwndDNS;
 };
+
+#define	MAX_DNS_SERVERS	4
+
+typedef struct	__dns_info
+{
+	BOOL	bVirtualCircuit;
+	BOOL	bComplete;
+	int	iError;
+	BOOL	bNameToAddress;
+	int	nTryNow;
+	int	iTryNow;
+	int	iRetry;
+	char	aachTryNow[MAX_DNS_SERVERS][4];
+	char	achInput[4];
+	char	*pchQuery;
+	int	iQueryLen;
+	HWND	hwndNotify;
+	char	*pchLocation;
+	u_int	wMsg;
+	short	idRequest;
+	short	idSent;
+} dns_info;
 
 struct	per_socket
 {
@@ -162,16 +199,22 @@ struct	per_socket
 	long			iEvents;
 	HWND			hWnd;
 	unsigned		wMsg;
+	struct sockaddr_in	sinLocal, sinRemote;
 	long			nOutstanding;
+	int			iConnectResult;
+	dns_info		*pdnsi;
 };
 
-#define	PSF_ACCEPT	0x0001
-#define	PSF_CONNECT	0x0002
-#define	PSF_SHUTDOWN	0x0004
-#define	PSF_NONBLOCK	0x0008
-#define	PSF_CLOSED	0x0010
-#define	PSF_MUSTCONN	0x0020
-#define	PSF_CONNECTING	0x0040
+#define	PSF_ACCEPT	0x0001	/* Socket is listening */
+#define	PSF_CONNECT	0x0002	/* Socket is connected */
+#define	PSF_SHUTDOWN	0x0004	/* Shutdown on send has been called */
+#define	PSF_NONBLOCK	0x0008	/* Socket is non blocking */
+#define	PSF_CLOSED	0x0010	/* Socket has been closed by the remote host */
+#define	PSF_MUSTCONN	0x0020	/* Socket must connect before using send or recv */
+#define	PSF_CONNECTING	0x0040	/* Socket is in the process of connecting */
+#define	PSF_BOUND	0x0080	/* Socket is bound to a local address */
+#define	PSF_CRUSED	0x0100	/* The result of the connect has been retrieved */
+#endif
 
 #define	MAX_OUTSTANDING	2048
 
@@ -193,5 +236,6 @@ struct	per_socket
 		  tf.pfaList = args, \
 		  tf.pfaResult = &retval )
 
+
 #endif
-
+

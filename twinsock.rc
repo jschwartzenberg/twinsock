@@ -1,27 +1,37 @@
-#include "c:\bc4\include\windows.h"
-#define	IDHELP	3
+#include "d:\bc45\include\windows.h"
 
 TSICON	ICON	"twinsock.ico"
 
 TS_MENU MENU 
 {
- POPUP "Setup"
+ POPUP "&Setup"
  {
-  MENUITEM "Communications...", 100
-  MENUITEM "Send break signal", 104
-  MENUITEM "Dial...", 105
+  MENUITEM "&Communications...", 100
+  MENUITEM "&Name servers...", 107
+  MENUITEM "&Send break signal", 104
+  MENUITEM "&Dial...", 105
   MENUITEM SEPARATOR
-  MENUITEM "Connect", 101
-  MENUITEM "Disconnect", 102
-  MENUITEM "Show protocol summary...", 106
+  MENUITEM "D&isconnect\tF8", 102
+  MENUITEM "Show &protocol summary...", 106
   MENUITEM SEPARATOR
-  MENUITEM "About TwinSock...", 201
+  MENUITEM "&Help", 301
+  MENUITEM "&About TwinSock...", 201
   MENUITEM SEPARATOR
-  MENUITEM "Exit", 103
+  MENUITEM "E&xit\tAlt-X", 103
  }
+
 }
-COMMS_DLG DIALOG 5, 19, 217, 108
-STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+
+TS_ACCELS ACCELERATORS
+{
+ VK_F1,  301, VIRTKEY
+ VK_F7,  101, VIRTKEY
+ "X", 103, ASCII, ALT
+ "x", 103, ASCII, ALT
+}
+
+COMMS_DLG DIALOG 5, 19, 293, 134
+STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | 4
 CAPTION "Communications Parameters"
 FONT 8, "MS Sans Serif"
 {
@@ -35,28 +45,34 @@ FONT 8, "MS Sans Serif"
  COMBOBOX 107, 61, 68, 89, 70, CBS_DROPDOWNLIST | WS_TABSTOP
  RTEXT "Stop &Bits", 108, 6, 91, 53, 8
  COMBOBOX 109, 61, 89, 89, 57, CBS_DROPDOWNLIST | WS_TABSTOP
- DEFPUSHBUTTON "OK", IDOK, 161, 6, 50, 14, BS_DEFPUSHBUTTON | WS_TABSTOP
- PUSHBUTTON "Cancel", IDCANCEL, 161, 24, 50, 14, WS_TABSTOP
- PUSHBUTTON "Help", IDHELP, 161, 42, 50, 14, WS_TABSTOP
+ GROUPBOX "Flow Control", 120, 163, 5, 120, 68, BS_GROUPBOX
+ CONTROL "&RTS/CTS (Modem)", 121, "BUTTON", BS_AUTORADIOBUTTON, 169, 20, 107, 12
+ CONTROL "DSR/DTR (Some direct)", 122, "BUTTON", BS_AUTORADIOBUTTON, 169, 37, 107, 12
+ CONTROL "&None (If all else fails)", 123, "BUTTON", BS_AUTORADIOBUTTON, 169, 54, 107, 12
+ LTEXT "Bu&ffers", -1, 165, 79, 116, 8
+ EDITTEXT 130, 166, 90, 72, 12, ES_RIGHT | WS_BORDER | WS_TABSTOP
+ LTEXT "Bytes", -1, 243, 91, 42, 8
+ DEFPUSHBUTTON "OK", 1, 43, 111, 50, 14, BS_DEFPUSHBUTTON | WS_TABSTOP
+ PUSHBUTTON "Cancel", 2, 111, 111, 50, 14, WS_TABSTOP
+ PUSHBUTTON "Help", 3, 179, 111, 50, 14, WS_TABSTOP
 }
 
-ABOUT_DLG DIALOG 26, 40, 194, 132
-STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+ABOUT_DLG DIALOG 26, 40, 194, 108
+STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | 4
 CAPTION "About TwinSock"
 FONT 8, "MS Sans Serif"
 {
- DEFPUSHBUTTON "OK", IDOK, 72, 109, 50, 14
+ DEFPUSHBUTTON "OK", IDOK, 73, 88, 50, 14
  ICON "TSICON", -1, 9, 12, 18, 20
- CTEXT "TwinSock 1.4", -1, 33, 7, 127, 8
+ CTEXT "TwinSock 2.0", -1, 33, 7, 127, 8
  CTEXT "Copyright 1994-1995 Troy Rollo", -1, 33, 20, 127, 8
- CTEXT "This Program Is Free Software", -1, 33, 33, 127, 8
- LTEXT "You may redistribute it under the terms of the file LICENSE.TXT, included with the TwinSock software.", -1, 33, 44, 127, 43
- CTEXT "Please direct questions and comments to twinsock@cbme.unsw.EDU.AU", -1, 30, 83, 142, 22
+ CTEXT "This Program Is Sponsored Free Software", -1, 33, 33, 127, 8
+ LTEXT "See the license in the help file for conditions of redistribution.", -1, 33, 44, 127, 34
 }
 
 
 DIAL_DLG DIALOG 24, 76, 153, 62
-STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | 4
 CAPTION "Dial"
 FONT 8, "MS Sans Serif"
 {
@@ -69,7 +85,7 @@ FONT 8, "MS Sans Serif"
 }
 
 PROTO_DLG DIALOG 18, 18, 142, 129
-STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | 4
 CAPTION "Protocol Summary"
 BEGIN
 	RTEXT "Packets Sent:", -1, 4, 3, 73, 8, SS_RIGHT | WS_CHILD | WS_VISIBLE | WS_GROUP
@@ -93,4 +109,38 @@ BEGIN
 	CONTROL "", 108, "STATIC", SS_LEFT | WS_CHILD | WS_VISIBLE | WS_BORDER | WS_GROUP, 81, 99, 28, 8
 END
 
-
+NS_DLG DIALOG 6, 15, 194, 121
+STYLE DS_MODALFRAME | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU | 4
+CAPTION "Name Servers"
+FONT 8, "MS Sans Serif"
+{
+ RTEXT "&Domain", -1, 3, 8, 49, 8
+ EDITTEXT 101, 57, 6, 127, 12
+ RTEXT "Name Server &1", -1, 3, 28, 51, 8
+ EDITTEXT 111, 57, 27, 24, 12
+ EDITTEXT 112, 91, 27, 24, 12
+ EDITTEXT 113, 125, 27, 24, 12
+ EDITTEXT 114, 159, 27, 24, 12
+ LTEXT ".", -1, 85, 27, 2, 8
+ LTEXT ".", -1, 117, 27, 2, 8
+ LTEXT ".", -1, 153, 27, 2, 8
+ RTEXT "Name Server &2", -1, 3, 48, 51, 8
+ EDITTEXT 121, 57, 47, 24, 12
+ EDITTEXT 122, 91, 46, 24, 12
+ EDITTEXT 123, 125, 46, 24, 12
+ EDITTEXT 124, 159, 46, 24, 12
+ LTEXT ".", -1, 85, 47, 2, 8
+ LTEXT ".", -1, 117, 46, 2, 8
+ LTEXT ".", -1, 153, 46, 2, 8
+ RTEXT "Name Server &3", -1, 3, 68, 51, 8
+ EDITTEXT 131, 57, 67, 24, 12
+ EDITTEXT 132, 91, 67, 24, 12
+ EDITTEXT 133, 125, 67, 24, 12
+ EDITTEXT 134, 159, 67, 24, 12
+ LTEXT ".", -1, 85, 67, 2, 8
+ LTEXT ".", -1, 117, 67, 2, 8
+ LTEXT ".", -1, 153, 67, 2, 8
+ CHECKBOX "O&verride Values Supplied By Host", 141, 7, 84, 175, 12, BS_AUTOCHECKBOX | WS_TABSTOP
+ DEFPUSHBUTTON "OK", 1, 46, 102, 50, 14
+ PUSHBUTTON "Cancel", 2, 106, 102, 50, 14
+}

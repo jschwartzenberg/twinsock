@@ -18,9 +18,11 @@
 #include <netdb.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include "twinsock.h"
 #include "tx.h"
 #include "wserror.h"
+#include "sockinfo.h"
 
 #ifdef NEED_H_ERRNO
 extern int h_errno;
@@ -356,6 +358,18 @@ ConvertSA(struct func_arg *pfa, struct sockaddr_in *sin)
 	return (struct sockaddr *) sin;
 }
 
+struct sockaddr *
+ConvertSABack(struct func_arg *pfa, struct sockaddr_in *sin)
+{
+	u_short tmp;
+
+	tmp = sin->sin_family;
+	tmp = RevFamily(tmp);
+	*(u_short *) sin = htons(tmp);
+	memcpy(pfa->pvData, sin, sizeof(*sin));
+	return (struct sockaddr *) sin;
+}
+
 int
 MapError(int iError)
 {
@@ -633,10 +647,43 @@ SendRemapMessage(	short	iFrom,
 }
 
 void
+Get_Arguments(	struct tx_request *ptxr,
+		struct func_arg **ppfaArgs,
+		struct func_arg *pfaResult,
+		int	*pnArgs)
+{
+	int	i, nArgs;
+	char	*pchData;
+	struct func_arg *pfaArgs, faResult;
+
+	nArgs = ntohs(ptxr->nArgs);
+
+	pfaArgs = (struct func_arg *) malloc(sizeof(struct func_arg) * nArgs);
+	pchData = ptxr->pchData;
+	for (i = 0; i < nArgs; i++)
+	{
+		pfaArgs[i].at = (enum arg_type) ntohs(ToShort(pchData));
+		pchData += sizeof(short);
+		pfaArgs[i].iLen = ntohs(ToShort(pchData));
+		pchData += sizeof(short);
+		pfaArgs[i].pvData = pchData;
+		pchData += pfaArgs[i].iLen;
+	}
+	faResult.at = (enum arg_type) ntohs(ToShort(pchData));
+	pchData += sizeof(short);
+	faResult.iLen = ntohs(ToShort(pchData));
+	pchData += sizeof(short);
+	faResult.pvData = pchData;
+	*ppfaArgs = pfaArgs;
+	*pfaResult = faResult;
+	*pnArgs = nArgs;
+}
+
+void
 ResponseReceived(struct tx_request *ptxr_)
 {
 	enum Functions ft;
-	short	nArgs;
+	int	nArgs;
 	short	nLen;
 	short	id;
 	short	iInPort;
@@ -666,28 +713,24 @@ ResponseReceived(struct tx_request *ptxr_)
 	ptxr = (struct tx_request *) malloc(nLen);
 	memcpy(ptxr, ptxr_, nLen);
 	ft = (enum Functions) ntohs(ptxr->iType);
-	nArgs = ntohs(ptxr->nArgs);
-
-	pfaArgs = (struct func_arg *) malloc(sizeof(struct func_arg) * nArgs);
-	pchData = ptxr->pchData;
-	for (i = 0; i < nArgs; i++)
-	{
-		pfaArgs[i].at = (enum arg_type) ntohs(ToShort(pchData));
-		pchData += sizeof(short);
-		pfaArgs[i].iLen = ntohs(ToShort(pchData));
-		pchData += sizeof(short);
-		pfaArgs[i].pvData = pchData;
-		pchData += pfaArgs[i].iLen;
-	}
-	faResult.at = (enum arg_type) ntohs(ToShort(pchData));
-	pchData += sizeof(short);
-	faResult.iLen = ntohs(ToShort(pchData));
-	pchData += sizeof(short);
-	faResult.pvData = pchData;
+	Get_Arguments(ptxr, &pfaArgs, &faResult, &nArgs);
 
 	iErrorSent = 0;
 	errno = 0;
 	h_errno = 0;
+
+	if (ft != FN_Socket && HasSocketArg(ft))
+	{
+		iSocket = GetServerFromClient(GetIntVal(&pfaArgs[0]));
+		if (iSocket == -1)
+		{
+			ptxr->nError = htons(WSAENOTSOCK);
+			ptxr->nLen = htons(sizeof(short) * 5);
+			PacketTransmitData(ptxr, sizeof(short) * 5, -2);
+			iErrorSent = 1;
+			ft = (enum Functions) -1;
+		}
+	}
 
 	switch(ft)
 	{
@@ -702,23 +745,25 @@ ResponseReceived(struct tx_request *ptxr_)
 		break;
 
 	case FN_Send:
-		SetIntVal(&faResult,
-			send(GetIntVal(&pfaArgs[0]),
-			     pfaArgs[1].pvData,
-			     GetIntVal(&pfaArgs[2]),
-			     GetIntVal(&pfaArgs[3])));
+		SetIntVal(&faResult, GetIntVal(&pfaArgs[2]));
+		QueueSendRequest(iSocket,
+				 pfaArgs[1].pvData,
+				 GetIntVal(&pfaArgs[2]),
+				 GetIntVal(&pfaArgs[3]),
+				 0);
 		nLen = CompressArg(ptxr, pfaArgs, nArgs, &faResult, 1);
+		errno = 0;
 		break;
 
 	case FN_SendTo:
-		SetIntVal(&faResult,
-			sendto(GetIntVal(&pfaArgs[0]),
-			       pfaArgs[1].pvData,
-			       GetIntVal(&pfaArgs[2]),
-			       GetIntVal(&pfaArgs[3]),
-			       ConvertSA(&pfaArgs[4], &sin),
-			       GetIntVal(&pfaArgs[5])));
+		SetIntVal(&faResult, GetIntVal(&pfaArgs[2]));
+		QueueSendRequest(iSocket,
+				 pfaArgs[1].pvData,
+				 GetIntVal(&pfaArgs[2]),
+				 GetIntVal(&pfaArgs[3]),
+				 ConvertSA(&pfaArgs[4], &sin));
 		nLen = CompressArg(ptxr, pfaArgs, nArgs, &faResult, 1);
+		errno = 0;
 		break;
 
 	case FN_Bind:
@@ -729,11 +774,16 @@ ResponseReceived(struct tx_request *ptxr_)
 		{
 			errno = 0;
 			sin.sin_port = htons(iPort);
-			iValue = bind(GetIntVal(&pfaArgs[0]),
+			iValue = bind(iSocket,
 					(struct sockaddr *) &sin,
 			     		GetIntVal(&pfaArgs[2]));
 			if (!iValue)
 			{
+				iLen = sizeof(sin);
+				getsockname(iSocket,
+					    (struct sockaddr *) &sin,
+					    &iLen);
+				ConvertSABack(&pfaArgs[1], &sin);
 				if (iPort != iInPort)
 					SendRemapMessage(iInPort, iPort);
 				break;
@@ -743,32 +793,47 @@ ResponseReceived(struct tx_request *ptxr_)
 		break;
 
 	case FN_Connect:
-		iSocket = GetIntVal(&pfaArgs[0]);
 		iValue = connect(iSocket,
 				ConvertSA(&pfaArgs[1], &sin),
 				GetIntVal(&pfaArgs[2]));
 		SetIntVal(&faResult, iValue);
 		if (iValue != -1)
+		{
 			BumpLargestFD(iSocket);
+			iLen = sizeof(sin);
+			getsockname(iSocket,
+				    (struct sockaddr *) &sin,
+				    &iLen);
+			ConvertSABack(&pfaArgs[1], &sin);
+			errno = 0;
+		}
+		else if (errno == EINPROGRESS)
+		{
+			SetWriter(iSocket);
+			QueueConnectWait(iSocket, ptxr);
+			iErrorSent = 1;
+		}
 		break;
 
 	case FN_Close:
 		SetIntVal(&faResult,
-			close(GetIntVal(&pfaArgs[0])));
-		FlushStream(GetIntVal(&pfaArgs[0]));
-		SetClosed(GetIntVal(&pfaArgs[0]));
+			close(iSocket));
+		iValue = GetIntVal(&pfaArgs[0]);
+		FlushStream(iValue);
+		SetClosed(iSocket);
+		ReleaseSocketEntry(iValue);
+		ReleaseServerSocket(iValue);
 		break;
 
 	case FN_Shutdown:
 		SetIntVal(&faResult,
-			shutdown(GetIntVal(&pfaArgs[0]),
+			shutdown(iSocket,
 				 GetIntVal(&pfaArgs[1])));
 		if (GetIntVal(&pfaArgs[1]) != 1)
-			SetClosed(GetIntVal(&pfaArgs[0]));
+			SetClosed(iSocket);
 		break;
 
 	case FN_Listen:
-		iSocket = GetIntVal(&pfaArgs[0]);
 		iValue = listen(iSocket,
 				GetIntVal(&pfaArgs[1]));
 		SetIntVal(&faResult, iValue);
@@ -780,12 +845,13 @@ ResponseReceived(struct tx_request *ptxr_)
 		break;
 
 	case FN_Socket:
-		iSocket = socket(GetFamily(GetIntVal(&pfaArgs[0])),
-				GetType(GetIntVal(&pfaArgs[1])),
-				GetProtocol(GetIntVal(&pfaArgs[2])));
+		iSocket = socket(GetFamily(GetIntVal(&pfaArgs[1])),
+				GetType(GetIntVal(&pfaArgs[2])),
+				GetProtocol(GetIntVal(&pfaArgs[3])));
 		SetIntVal(&faResult,iSocket);
 		if (iSocket != -1)
 		{
+			AddSocketEntry(GetIntVal(&pfaArgs[0]), iSocket);
 			BumpLargestFD(iSocket);
 			nOptVal = 1;
 			iLen = sizeof(nOptVal);
@@ -794,13 +860,16 @@ ResponseReceived(struct tx_request *ptxr_)
 					SO_OOBINLINE,
 					(char *) &nOptVal,
 					iLen);
+			iValue = fcntl(iSocket, F_GETFL, 0);
+			iValue |= FNDELAY;
+			fcntl(iSocket, F_SETFL, iValue);
 			errno = 0;
 		}
 		break;
 
 	case FN_GetPeerName:
 		iLen = GetIntVal(&pfaArgs[2]);
-		iValue = getpeername(GetIntVal(&pfaArgs[0]),
+		iValue = getpeername(iSocket,
 				     (struct sockaddr *) pfaArgs[1].pvData,
 				     &iLen);
 		if (iValue != -1)
@@ -818,7 +887,7 @@ ResponseReceived(struct tx_request *ptxr_)
 
 	case FN_GetSockName:
 		iLen = GetIntVal(&pfaArgs[2]);
-		iValue = getsockname(GetIntVal(&pfaArgs[0]),
+		iValue = getsockname(iSocket,
 				     (struct sockaddr *) pfaArgs[1].pvData,
 				     &iLen);
 		if (iValue != -1)
@@ -837,7 +906,7 @@ ResponseReceived(struct tx_request *ptxr_)
 	case FN_GetSockOpt:
 		iLen = GetIntVal(&pfaArgs[4]);
 		nOptName = GetOption(GetIntVal(&pfaArgs[2]));
-		iValue = getsockopt(	GetIntVal(&pfaArgs[0]),
+		iValue = getsockopt(	iSocket,
 					GetIntVal(&pfaArgs[1]),
 					nOptName,
 					(char *) pfaArgs[3].pvData,
@@ -856,7 +925,7 @@ ResponseReceived(struct tx_request *ptxr_)
 		nOptName = GetOption(GetIntVal(&pfaArgs[2]));
 		SwapSockOptIn(&pfaArgs[3],
 				nOptName);
-		iValue = setsockopt(	GetIntVal(&pfaArgs[0]),
+		iValue = setsockopt(	iSocket,
 					SOL_SOCKET,
 					nOptName,
 					(char *) pfaArgs[3].pvData,
@@ -962,6 +1031,39 @@ ResponseReceived(struct tx_request *ptxr_)
 			ptxr->nError = htons(MapError(errno));
 		PacketTransmitData(ptxr, nLen, -2);
 	}
+	free(ptxr);
+	free(pfaArgs);
+}
+
+void
+FinishConnect(tws_sockinfo *psi)
+{
+	int	iResult;
+	struct sockaddr_in sin;
+	int	iLen;
+	struct tx_request *ptxr = psi->ptxrConnect;
+	struct func_arg *pfaArgs, faResult;
+	char	c;
+	int nArgs;
+
+	Get_Arguments(ptxr, &pfaArgs, &faResult, &nArgs);
+	psi->ptxrConnect = 0;
+	iLen = sizeof(sin);
+	getsockname(psi->iServerSocket,
+			(struct sockaddr *) &sin, &iLen);
+	iResult = write(psi->iServerSocket, &c, 0);
+	if (iResult == -1)
+	{
+		ptxr->nError = htons(MapError(errno));
+	}
+	else
+	{
+		BumpLargestFD(psi->iServerSocket);
+		ptxr->nError = 0;
+	}
+	ConvertSABack(&pfaArgs[1], &sin);
+	SetIntVal(&faResult, iResult);
+	PacketTransmitData(ptxr, ntohs(ptxr->nLen), -2);
 	free(ptxr);
 	free(pfaArgs);
 }

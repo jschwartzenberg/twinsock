@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <netinet/in.h>
 #include <errno.h>
 #ifdef NEED_SELECT_H
@@ -22,6 +23,7 @@
 #endif
 #include "twinsock.h"
 #include "tx.h"
+#include "sockinfo.h"
 
 extern	enum Encoding eLine;
 
@@ -31,6 +33,7 @@ extern	void	PacketTransmitData(void *pvData, int iDataLen, int iStream);
 
 static	fd_set	fdsActive;
 static	fd_set	fdsListener;
+static	fd_set	fdsWriting;
 static	int	nLargestFD;
 static	char	achBuffer[BUFFER_SIZE];
 static	int	bFlushing = 0;
@@ -38,7 +41,12 @@ void	FlushInput(void);
 
 int	GetNextExpiry(struct timeval *ptvValue);
 void	CheckTimers(void);
+void	WriteSocketData(tws_sockinfo *psi);
 extern	char	*sys_errlist[];
+
+static	int	nHosts = 0;
+static	char	achDomain[256] = "";
+static	char	aachHosts[4][30];
 
 #define	TIMER_ID_SEND		0
 #define	TIMER_ID_RECEIVE	1
@@ -56,11 +64,67 @@ int	SetListener(int iValue)
 	FD_SET(iValue, &fdsListener);
 }
 
+int	SetWriter(int iValue)
+{
+	if (iValue > nLargestFD)
+		nLargestFD = iValue;
+	FD_SET(iValue, &fdsWriting);
+}
+
 int	SetClosed(int iValue)
 {
 	FD_CLR(iValue, &fdsListener);
 	FD_CLR(iValue, &fdsActive);
+	FD_CLR(iValue, &fdsWriting);
 }
+
+void
+read_resolver(void)
+{
+	FILE	*fp;
+	char	achInput[80];
+	char	*pchIn, *pchOut;
+
+	fp = fopen("/etc/resolv.conf", "r");
+	if (!fp)
+	{
+		fp = fopen("/usr/etc/resolv.conf", "r");
+		if (!fp)
+			return;
+	}
+	while (fgets(achInput, 80, fp))
+	{
+		if (achInput[strlen(achInput) - 1] == '\n')
+			achInput[strlen(achInput) - 1] = 0;
+		pchIn = achInput;
+		while (isspace(*pchIn))
+				pchIn++;
+		if (!strncmp(pchIn, "domain", 6))
+		{
+			pchIn += 6;
+			while (isspace(*pchIn))
+				pchIn++;
+			pchOut = achDomain;
+			while (*pchIn && !isspace(*pchIn))
+				*pchOut++ = *pchIn++;
+			*pchOut = 0;
+		}
+		else if (!strncmp(pchIn, "nameserver", 10) && nHosts < 4)
+		{
+			pchIn += 10;
+			while (isspace(*pchIn))
+				pchIn++;
+			pchOut = aachHosts[nHosts];
+			while (*pchIn && !isspace(*pchIn))
+				*pchOut++ = *pchIn++;
+			*pchOut = 0;
+			nHosts++;
+		}
+	}
+	fclose(fp);
+}
+
+static	char	achHostName[256];
 
 main(int argc, char **argv)
 {
@@ -111,7 +175,8 @@ main(int argc, char **argv)
 		}
 	}
 
-	fprintf(stderr, "TwinSock Host 1.4\n");
+	read_resolver();
+	fprintf(stderr, "TwinSock Host 2.0\n");
 	fprintf(stderr, "Copyright 1994-1995 Troy Rollo\n");
 	fprintf(stderr, "This program is free software\n");
 	fprintf(stderr, "See the file COPYING for details\n");
@@ -121,19 +186,26 @@ main(int argc, char **argv)
 		InitTerm();
 
 	InitProtocol();
-	fprintf(stdout, "!@$TSStart%d$@", (int) eLine);
+	*achHostName = 0;
+	gethostname(achHostName, 256);
+	fprintf(stdout, "!@$TSStart%d:%s", (int) eLine, achHostName);
+	fprintf(stdout, "#%s", achDomain);
+	for ( i = 0; i < nHosts; i++)
+		fprintf(stdout, "*%s", aachHosts[i]);
+	fprintf(stdout, "$@");
 	fflush(stdout);
 
 	nLargestFD = 0;
 	FD_ZERO(&fdsActive);
-	FD_ZERO(&fdsWrite);
 	FD_ZERO(&fdsExcept);
+	FD_ZERO(&fdsWriting);
 
 	FD_SET(0, &fdsActive);
 
 	while(1)
 	{
 		fdsRead = fdsActive;
+		fdsWrite = fdsWriting;
 		iResult = select(nLargestFD + 1,
 				&fdsRead,
 				&fdsWrite,
@@ -159,6 +231,18 @@ main(int argc, char **argv)
 		}
 		for (i = 3; i <= nLargestFD; i++)
 		{
+			if (FD_ISSET(i, &fdsWrite))
+			{
+				tws_sockinfo *psi;
+
+				FD_CLR(i, &fdsWriting);
+				psi = FindSocketEntry(i);
+				if (!psi)
+					continue;
+				if (psi->ptxrConnect)
+					FinishConnect(psi);
+				WriteSocketData(psi);
+			}
 			if (FD_ISSET(i, &fdsRead))
 			{
 				FD_ZERO(&fdsDummy);
@@ -174,14 +258,18 @@ main(int argc, char **argv)
 				nSourceLen = sizeof(saSource);
 				if (FD_ISSET(i, &fdsListener))
 				{
+					int	iClient;
+
 					s = accept(i,
 						&saSource,
 						&nSourceLen);
 					if (s == -1)
 						continue;
-					s = htonl(s);
+					iClient = GetServerSocket();
+					AddSocketEntry(iClient, s);
 					BumpLargestFD(s);
-					SendSocketData(i,
+					s = htonl(iClient);
+					SendSocketData(GetClientFromServer(i),
 						&s,
 						sizeof(s),
 						&saSource,
@@ -200,11 +288,11 @@ main(int argc, char **argv)
 					    errno == ENOTCONN)
 					{
 						/* Was a datagram socket */
-						SetClosed(i);
+						FD_CLR(i, &fdsActive);
 						continue;
 					}
 					if (nRead >= 0)
-						SendSocketData(i,
+						SendSocketData(GetClientFromServer(i),
 							achBuffer,
 							nRead,
 							&saSource,
@@ -463,4 +551,49 @@ DataReceived(void *pvData, int iLen)
 		}
 	}
 }
-
+
+void
+WriteSocketData(tws_sockinfo *psi)
+{
+	int	iResult;
+
+	if (!psi->pdata)
+		return;
+	if (psi->pdata->bTo)
+	{
+		iResult = sendto(psi->iServerSocket,
+				psi->pdata->pchData + psi->pdata->iLoc,
+				psi->pdata->nBytes - psi->pdata->iLoc,
+				psi->pdata->iFlags,
+				(struct sockaddr *) &psi->pdata->sinDest,
+				sizeof(struct sockaddr_in));
+	}
+	else
+	{
+		iResult = sendto(psi->iServerSocket,
+				psi->pdata->pchData + psi->pdata->iLoc,
+				psi->pdata->nBytes - psi->pdata->iLoc,
+				psi->pdata->iFlags);
+	}
+	if (iResult >= 0)
+	{
+		tws_data *pdata = psi->pdata;
+
+		pdata->iLoc += iResult;
+		if (pdata->iLoc == pdata->nBytes)
+		{
+			psi->pdata = pdata->pdataNext;
+			free(pdata->pchData);
+			free(pdata);
+		}
+	}
+	else
+	{
+		if (errno != EWOULDBLOCK &&
+		    errno != EINTR &&
+		    errno != EAGAIN)
+			return; /* The socket is dead */
+	}
+	if (psi->pdata)
+		FD_SET(psi->iServerSocket, &fdsWriting);
+}

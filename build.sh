@@ -151,7 +151,7 @@ esac
 
 rm -f a.out test.c
 
-OBJECTS="tshost.o packet.o getentry.o commands.o ${TERM_OBJECT} $NEED_MEM"
+OBJECTS="tshost.o packet.o getentry.o commands.o getsock.o sockinfo.o ${TERM_OBJECT} $NEED_MEM"
 
 echo "Building makefile"
 echo ".c.o:" > Makefile

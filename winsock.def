@@ -50,9 +50,8 @@ EXPORTS
             WSASTARTUP                     @115 
             WSACLEANUP                     @116 
             __WSAFDISSET                   @151 
-            RESPONSERECEIVED               @200
-            REGISTERMANAGER                @201
-            SETINITIALISED                 @202
-            WEP                            @203 
-            LIBMAIN                        @204 
+
+            WEP                            @1000 
+            LIBMAIN                        @1001 
+            DDEPROC			   @1002
 

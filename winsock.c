@@ -17,8 +17,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <dos.h>
+#include <ddeml.h>
 #include "twinsock.h"
 #include "tx.h"
+#include "sockinfo.h"
+#include "dns.h"
 
 #ifdef __MSDOS__
 #define	PORTSWAP(x)	ntohs(x)
@@ -33,29 +36,46 @@ static	struct	per_task	*pptList = 0;
 static	struct	per_socket	*ppsList = 0;
 static	struct	tx_queue	*ptxqList = 0;
 
-HWND	hwndManager = 0;
-BOOL	bEstablished = 0;
+static	HINSTANCE hInstance = 0;
 
 static	void	FireAsyncRequest(struct tx_queue *ptxq);
+static	void	ContinueDNSQuery(struct per_socket *pps);
+static	void	NextDNSServer(	struct per_socket *pps);
+static	void	NextDNSTry(	struct per_socket *pps);
 
-int FAR PASCAL
+#pragma argsused
+int CALLBACK
 LibMain(HINSTANCE hInst, WORD wOne, WORD wTwo, LPSTR lpstr)
 {
+	hInstance = hInst;
 	return TRUE;
 }
 
-void far pascal _export
-RegisterManager(HWND hwnd)
+#pragma argsused
+int CALLBACK
+WEP(int iExitType)
 {
-	hwndManager = hwnd;
+	return 1;
 }
 
-void far pascal _export
-SetInitialised(void)
+#ifdef __FLAT__
+#pragma argsused
+BOOL WINAPI
+DllEntryPoint(	HINSTANCE hinstDLL,
+		DWORD	dwReason,
+		LPVOID lpvReserved)
 {
-	bEstablished = TRUE;
-}
+	switch(dwReason)
+	{
+	case DLL_PROCESS_ATTACH:
+		return LibMain(hinstDLL, 0, 0, 0);
 
+	case DLL_PROCESS_DETACH:
+		return WEP(0);
+	}
+	return TRUE;
+}
+#endif
 
 void
 CopyDataIn(	void		*pvSource,
@@ -132,7 +152,11 @@ GetAnotherTaskInfo(HTASK htask)
 static	struct	per_task *
 GetTaskInfo(void)
 {
+#ifdef __FLAT__
+	return GetAnotherTaskInfo(0);
+#else
 	return GetAnotherTaskInfo(GetCurrentTask());
+#endif
 }
 
 
@@ -184,6 +208,7 @@ NewSocket(struct per_task *ppt, SOCKET s)
 	ppsNew->ppsNext = ppsList;
 	ppsNew->iEvents = 0;
 	ppsNew->nOutstanding = 0;
+	ppsNew->pdnsi = 0;
 	ppsList = ppsNew;
 	return ppsNew;
 	
@@ -204,13 +229,17 @@ RemoveSocket(struct per_socket *pps)
 	{
 		if (!(ppsParent->iFlags & PSF_ACCEPT))
 			continue;
-		for (ppd = &ppsParent->pdIn; *ppd; ppd = &(*ppd)->pdNext)
+		for (ppd = &ppsParent->pdIn; *ppd;)
 		{
 			if ((*ppd)->pchData == (char *) pps)
 			{
 				pd = *ppd;
 				*ppd = pd->pdNext;
 				free(pd);
+			}
+			else
+			{
+				ppd = &(*ppd)->pdNext;
 			}
 		}
 	}
@@ -230,7 +259,6 @@ RemoveSocket(struct per_socket *pps)
 				if (pps->iFlags & PSF_ACCEPT)
 				{
 					SendEarlyClose(((struct per_socket *) pd->pchData)->s);
-					RemoveSocket((struct per_socket *) pd->pchData);
 				}
 				else
 				{
@@ -238,6 +266,8 @@ RemoveSocket(struct per_socket *pps)
 				}
 				free(pd);
 			}
+			if (!(((int) pps->s) & 1))
+				ReleaseClientSocket(pps->s);
 			free(pps);
 			return;
 		}
@@ -298,7 +328,9 @@ FunctionReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 		ppt = GetAnotherTaskInfo(pps->htaskOwner);
 		ppsNew = NewSocket(ppt, ns);
 		pdNew->pchData = (char *) ppsNew;
-		ppsNew->iFlags |= PSF_CONNECT;
+		ppsNew->iFlags |= PSF_CONNECT | PSF_BOUND;
+		ppsNew->sinLocal = pps->sinLocal;
+		ppsNew->sinRemote = pdNew->sin;
 		Notify(pps, FD_ACCEPT);
 	}
 	else
@@ -306,12 +338,13 @@ FunctionReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 		pdNew->iLen = nLen;
 		pdNew->pchData = (char *) malloc(nLen);
 		if (pdNew->pchData == 0)
-		{
 			pdNew->iLen = 0;	/* Return EOF to the application */
-			return;
-		}
-		memcpy(pdNew->pchData, pvData, nLen);
-		Notify(pps, nLen ? FD_READ : FD_CLOSE);
+		else
+			memcpy(pdNew->pchData, pvData, nLen);
+		if (pps->pdnsi)
+			ContinueDNSQuery(pps);
+		else
+			Notify(pps, nLen ? FD_READ : FD_CLOSE);
 	}
 }
 
@@ -337,14 +370,11 @@ EndBlocking(struct per_task *ppt)
 	ppt->bBlocking = FALSE;
 }
 
-static	BOOL
-FlushMessages(struct per_task *ppt)
+BOOL	CALLBACK _export
+DefBlockFunc(void)
 {
 	MSG msg;
 	BOOL ret;
-
-	if (ppt->lpBlockFunc)
-		return ((BOOL (far pascal *)()) ppt->lpBlockFunc)();
 
  	ret = (BOOL) PeekMessage(&msg,0,0,0,PM_REMOVE);
 	if (ret)
@@ -356,9 +386,19 @@ FlushMessages(struct per_task *ppt)
 		 * *can* fail.
 		 */
 		if (msg.message == WM_QUIT)
-			ppt->bCancel = TRUE;
+			WSACancelBlockingCall();
 	}
 	return ret;
+}
+
+static	BOOL
+FlushMessages(struct per_task *ppt)
+{
+
+	if (ppt->lpBlockFunc)
+		return ((BOOL (CALLBACK *)(void)) ppt->lpBlockFunc)();
+	else
+		return DefBlockFunc();
 }
 
 static	void
@@ -383,24 +423,31 @@ RemoveTask(struct per_task *ppt)
 {
 	struct per_task **pppt;
 
+	DestroyWindow(ppt->hwndDNS);
 	for (pppt = &pptList; *pppt; pppt = &((*pppt)->pptNext))
 	{
 		if (*pppt == ppt)
 		{
 			*pppt = ppt->pptNext;
+			free(ppt->pClient);
 			free(ppt);
 			break;
 		}
 	}
 };
 
-void far pascal _export
-ResponseReceived(struct tx_request *ptxr)
+#pragma argsused
+void
+ResponseReceived(	char	*pchData,
+			int	iSize,
+			long	iFrom)
 {
 	int		nLen;
 	int		id;
 	struct	tx_queue *ptxq;
 	enum Functions	ft;
+	struct tx_request *ptxr = (struct tx_request *) pchData;
+	struct	sockaddr_in *psin;
 
 	ft = (enum Functions) ntohs(ptxr->iType);
 	id = ntohs(ptxr->id);
@@ -421,7 +468,7 @@ ResponseReceived(struct tx_request *ptxr)
 			return;
 		}
 	}
-	if (ft == FN_SendTo || ft == FN_Send || ft == FN_Connect)
+	if (ft == FN_SendTo || ft == FN_Send || ft == FN_Connect || ft == FN_Close)
 	{
 		int	iOffset = 0;
 		int	iLen;
@@ -441,6 +488,14 @@ ResponseReceived(struct tx_request *ptxr)
 		case FN_Connect:
 			nCode = 3;
 			break;
+
+		case FN_Close:
+			nCode = 0;
+			break;
+
+		default:
+			nCode = -1;
+			break;
 		}
 
 		for (i = 0; i <= nCode; i++)
@@ -449,6 +504,8 @@ ResponseReceived(struct tx_request *ptxr)
 			iOffset += 2;
 			iLen = ntohs(*(short *) (ptxr->pchData + iOffset));
 			iOffset += 2;
+			if (i == 1)
+					psin = (struct sockaddr_in *) (ptxr->pchData + iOffset);
 			if (i == 0 || i == nCode)
 			{
 				if (at == AT_Int16)
@@ -460,18 +517,30 @@ ResponseReceived(struct tx_request *ptxr)
 					pps = GetSocketInfo(nValue);
 					if (!pps)
 						return;
+					if (ft == FN_Close)
+					{
+						RemoveSocket(pps);
+					}
 				}
 				else if (ft == FN_Connect)
 				{
 					if (nValue < 0)
 					{
+						pps->iConnectResult = ntohs(ptxr->nError);
 						NotifyError(pps, FD_CONNECT, ntohs(ptxr->nError));
 					}
 					else
 					{
+						pps->iConnectResult = 0;
 						pps->iFlags |= PSF_CONNECT;
 						Notify(pps, FD_CONNECT);
 						Notify(pps, FD_WRITE);
+						if (!pps->iFlags & PSF_BOUND)
+						{
+							psin->sin_family = ntohs(psin->sin_family);
+							pps->sinLocal = *psin;
+							pps->iFlags |= PSF_BOUND;
+						}
 					}
 				}
 				else
@@ -502,6 +571,7 @@ TransmitFunction(struct transmit_function *ptf)
 	struct	tx_request *ptxr;
 	struct	tx_queue *ptxq, **pptxq;
 	int	iOffset;
+	struct per_task *ppt = GetTaskInfo();
 
 	for (i = 0; i < ptf->nArgs; i++)
 		nSize += ptf->pfaList[i].iLen + sizeof(short) * 2;
@@ -555,7 +625,7 @@ TransmitFunction(struct transmit_function *ptf)
 	idNext++;
 	for (pptxq = &ptxqList; *pptxq; pptxq = &((*pptxq)->ptxqNext));
 	*pptxq = ptxq;
-	SendMessage(hwndManager, WM_USER, nSize, (LPARAM) ptxr);
+	SendDataTo(ppt->pClient, (char *) ptxr, nSize, 0);
 	return ptxq;
 };
 
@@ -707,8 +777,6 @@ CopyHostEntTo(struct per_task *ppt, char *pchData)
 	char	*pchOld;
 	int	nAlii;
 
-	CopyHostEnt(ppt);
-
 	phe = (struct hostent *) pchData;
 	memcpy(phe, &ppt->he, sizeof(ppt->he));
 
@@ -851,7 +919,7 @@ CopyProtoEntTo(struct per_task *ppt, char *pchData)
 	return (pchData - (char *) ppe);
 }
 
-SOCKET pascal far _export
+SOCKET CALLBACK _export
 accept(SOCKET s, struct sockaddr FAR *addr,
                           int FAR *addrlen)
 {
@@ -870,7 +938,6 @@ accept(SOCKET s, struct sockaddr FAR *addr,
 	}
 	if (!pps->pdIn && (pps->iFlags & PSF_NONBLOCK))
 	{
-		FlushMessages(ppt); /* Some apps will call this in a tight loop */
 		iErrno = WSAEWOULDBLOCK;
 		return (INVALID_SOCKET);
 	}
@@ -904,7 +971,7 @@ accept(SOCKET s, struct sockaddr FAR *addr,
 	return ppsNew->s;
 }
 
-int pascal far _export
+int CALLBACK _export
 bind(SOCKET s, const struct sockaddr FAR *addr, int namelen)
 {
 	struct per_task *ppt;
@@ -913,10 +980,11 @@ bind(SOCKET s, const struct sockaddr FAR *addr, int namelen)
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 	struct	sockaddr	*psa;
+	struct	per_socket 	*pps;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return -1;
-	if (!GetSocketInfo(s))
+	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
 	if ((namelen < sizeof(*psa)) || IsBadReadPtr(addr, sizeof(*psa)))
 	{
@@ -933,38 +1001,42 @@ bind(SOCKET s, const struct sockaddr FAR *addr, int namelen)
 	memcpy(psa, addr, namelen);
 	psa->sa_family = htons(psa->sa_family);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
-	INIT_CARGS(pfaArgs[1],	AT_GenPtr,	psa,		namelen			);
+	INIT_ARGS(pfaArgs[1],	AT_GenPtr,	psa,		namelen			);
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&namelen,	sizeof(namelen)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Bind, 3, pfaArgs, pfaReturn);
 	TransmitFunctionAndBlock(ppt, &tf);
+	if (nReturn != -1)
+	{
+		psa->sa_family = ntohs(psa->sa_family);
+		pps->sinLocal = *(struct sockaddr_in *) psa;
+		pps->iFlags |= PSF_BOUND;
+	}
 	free(psa);
 	return nReturn;
 }
 
-int pascal far _export
+int CALLBACK _export
 closesocket(SOCKET s)
 {
-	struct per_task *ppt;
 	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[1];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Close, 1, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	RemoveSocket(pps); /* Assume success. Is this valid? */
-	return nReturn;
+	RemoveTXQ(TransmitFunction(&tf));
+	return 0;
 }
 
-int pascal far _export
+int CALLBACK _export
 connect(SOCKET s, const struct sockaddr FAR *name, int namelen)
 {
 	struct per_task *ppt;
@@ -979,6 +1051,24 @@ connect(SOCKET s, const struct sockaddr FAR *name, int namelen)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
+	if (pps->iFlags & PSF_CONNECT)
+	{
+		if (pps->iFlags & PSF_CRUSED)
+		{
+			iErrno = WSAEISCONN;
+			return -1;
+		}
+		pps->iFlags |= PSF_CRUSED;
+		if (pps->iConnectResult)
+		{
+			iErrno = pps->iConnectResult;
+			return -1;
+		}
+		else
+		{
+			return 0;
+		}
+	}
 	if ((namelen < sizeof(*psa)) || IsBadReadPtr(name, sizeof(*psa)))
 	{
 		iErrno = WSAEFAULT;
@@ -992,35 +1082,44 @@ connect(SOCKET s, const struct sockaddr FAR *name, int namelen)
 		return (SOCKET_ERROR);
 	}
 	memcpy(psa, name, namelen);
+	pps->sinRemote = *(struct sockaddr_in *) psa;
 	psa->sa_family = htons(psa->sa_family);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
-	INIT_CARGS(pfaArgs[1],	AT_GenPtr,	psa,		namelen			);
+	INIT_ARGS(pfaArgs[1],	AT_GenPtr,	psa,		namelen			);
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&namelen,	sizeof(namelen)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Connect, 3, pfaArgs, pfaReturn);
-	if (pps->iEvents & FD_CONNECT)
+	if (pps->iFlags & PSF_NONBLOCK)
 	{
 		pps->iFlags |= PSF_CONNECTING;
 		RemoveTXQ(TransmitFunction(&tf));
-		nReturn = 0;
+		iErrno = WSAEWOULDBLOCK;
+		nReturn = -1;
 	}
 	else
 	{
 		TransmitFunctionAndBlock(ppt, &tf);
 		if (nReturn != -1)
+		{
 			pps->iFlags |= PSF_CONNECT;
+			if (!(pps->iFlags & PSF_BOUND))
+			{
+				psa->sa_family = ntohs(psa->sa_family);
+				pps->sinLocal = *(struct sockaddr_in *) psa;
+				pps->iFlags |= PSF_BOUND | PSF_CRUSED;
+			}
+		}
 	}
 	free(psa);
 	return nReturn;
 }
 
-int pascal far _export
+int CALLBACK _export
 ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 {
-	struct per_task *ppt;
 	struct per_socket *pps;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
@@ -1062,56 +1161,48 @@ ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 	return 0;
 }
 
-int pascal far _export getpeername (SOCKET s, struct sockaddr FAR *name,
+int CALLBACK _export getpeername (SOCKET s, struct sockaddr FAR *name,
                             int FAR * namelen)
 {
-	struct per_task *ppt;
-	int	nReturn;
-	struct	func_arg pfaArgs[3];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
+	struct per_socket *pps;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
-	if (!GetSocketInfo(s))
+	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
-	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
-	INIT_ARGS(pfaArgs[1],	AT_GenPtr,	name,		*namelen		);
-	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	namelen,	sizeof(*namelen)	);
-	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
-	INIT_TF(tf, FN_GetPeerName, 3, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	if (nReturn != -1)
-		name->sa_family = ntohs(name->sa_family);
-	return nReturn;
+	if (!(pps->iFlags & PSF_CONNECT))
+	{
+		iErrno = WSAENOTCONN;
+		return -1;
+	}
+	*namelen = sizeof(struct sockaddr_in); /* Just in case */
+	memcpy(name, &pps->sinRemote, sizeof(struct sockaddr_in));
+	return 0;
 }
 
-int pascal far _export getsockname (SOCKET s, struct sockaddr FAR *name,
+int CALLBACK _export getsockname (SOCKET s, struct sockaddr FAR *name,
                             int FAR * namelen)
 {
-	struct per_task *ppt;
-	int	nReturn;
-	struct	func_arg pfaArgs[3];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
+	struct per_socket *pps;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
-	if (!GetSocketInfo(s))
+	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
 	*namelen = sizeof(struct sockaddr_in); /* Just in case */
-	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
-	INIT_ARGS(pfaArgs[1],	AT_GenPtr,	name,		*namelen		);
-	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	namelen,	sizeof(*namelen)	);
-	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
-	INIT_TF(tf, FN_GetSockName, 3, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	if (nReturn != -1)
-		name->sa_family = ntohs(name->sa_family);
-	return nReturn;
+	if (pps->iFlags & PSF_BOUND)
+	{
+		memcpy(name, &pps->sinLocal, sizeof(struct sockaddr_in));
+	}
+	else
+	{
+		memset(name, 0, sizeof(struct sockaddr_in));
+		((struct sockaddr_in *) name)->sin_family = AF_INET;
+	}
+	return 0;
 }
 
-int pascal far _export getsockopt (SOCKET s, int level, int optname,
+int CALLBACK _export getsockopt (SOCKET s, int level, int optname,
                            char FAR * optval, int FAR *optlen)
 {
 	struct per_task *ppt;
@@ -1158,7 +1249,7 @@ int pascal far _export getsockopt (SOCKET s, int level, int optname,
 	return nReturn;
 }
 
-u_long pascal far _export htonl (u_long hostlong)
+u_long CALLBACK _export htonl (u_long hostlong)
 {
 	char	*pchValue = (char *) &hostlong;
 	char	c;
@@ -1172,7 +1263,7 @@ u_long pascal far _export htonl (u_long hostlong)
 	return hostlong;
 }
 
-u_short pascal far _export htons (u_short hostshort)
+u_short CALLBACK _export htons (u_short hostshort)
 {
 	char	*pchValue = (char *) &hostshort;
 	char	c;
@@ -1183,41 +1274,38 @@ u_short pascal far _export htons (u_short hostshort)
 	return hostshort;
 }
 
-unsigned long pascal far _export inet_addr (const char FAR * cp)
+unsigned long CALLBACK _export inet_addr (const char FAR * cp)
 {
 	unsigned long	iValue;
 	char	*pchValue = (char *) &iValue;
+	int	iTmp;
+	int	i;
 
 	if (!GetTaskInfo())
 		return (INADDR_NONE);
-	pchValue[0] = atoi(cp);
-	cp = strchr(cp, '.');
-	if (cp)
+	
+	for (i = 0; i < 4; i++)
 	{
-		cp++;
-		pchValue[1] = atoi(cp);
-		cp = strchr(cp, '.');
-		if (cp)
+		iTmp = 0;
+		if (!isdigit(*cp))
+			return INADDR_NONE;
+		while (isdigit(*cp))
 		{
+			iTmp *= 10;
+			iTmp += *cp - '0';
 			cp++;
-			pchValue[2] = atoi(cp);
-			cp = strchr(cp, '.');
-			if (cp)
-			{
-				cp++;
-				pchValue[3] = atoi(cp);
-				cp = strchr(cp, '.');
-				if (!cp)
-				{
-					return iValue;
-				}
-			}
 		}
+		if (iTmp > 255 || iTmp < 0)
+			return INADDR_NONE;
+		if (*cp != (i == 3 ? '\0' : '.'))
+			return INADDR_NONE;
+		cp++;
+		pchValue[i] = iTmp;
 	}
-	return (INADDR_NONE);
+	return iValue;
 }
 
-char FAR * pascal far _export inet_ntoa (struct in_addr in)
+char FAR * CALLBACK _export inet_ntoa (struct in_addr in)
 {
 	struct per_task *ppt;
 
@@ -1232,16 +1320,15 @@ char FAR * pascal far _export inet_ntoa (struct in_addr in)
 	return ppt->achAddress;
 }
 
-int pascal far _export listen (SOCKET s, int backlog)
+int CALLBACK _export listen (SOCKET s, int backlog)
 {
-	struct per_task *ppt;
 	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[2];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
@@ -1250,17 +1337,27 @@ int pascal far _export listen (SOCKET s, int backlog)
 		iErrno = WSAEISCONN;
 		return -1;
 	}
+	if (!(pps->iFlags & PSF_BOUND))
+	{
+		/* Bind first - we need to know the address */
+		struct	sockaddr_in sin;
+
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_port = 0;
+		sin.sin_addr.s_addr = INADDR_ANY;
+		bind(s, (struct sockaddr *) &sin, sizeof(sin));
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&backlog,	sizeof(backlog)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Listen, 2, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	if (nReturn != -1)
-		pps->iFlags |= PSF_ACCEPT;
-	return nReturn;
+	RemoveTXQ(TransmitFunction(&tf));
+	pps->iFlags |= PSF_ACCEPT;
+	return 0;
 }
 
-u_long pascal far _export ntohl (u_long netlong)
+u_long CALLBACK _export ntohl (u_long netlong)
 {
 	char	*pchValue = (char *) &netlong;
 	char	c;
@@ -1274,7 +1371,7 @@ u_long pascal far _export ntohl (u_long netlong)
 	return netlong;
 }
 
-u_short pascal far _export ntohs (u_short netshort)
+u_short CALLBACK _export ntohs (u_short netshort)
 {
 	char	*pchValue = (char *) &netshort;
 	char	c;
@@ -1285,12 +1382,13 @@ u_short pascal far _export ntohs (u_short netshort)
 	return netshort;
 }
 
-int pascal far _export recv (SOCKET s, char FAR * buf, int len, int flags)
+int CALLBACK _export recv (SOCKET s, char FAR * buf, int len, int flags)
 {
 	return recvfrom(s, buf, len, flags, 0, 0);
 }
 
-int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
+#pragma argsused
+int CALLBACK _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
                          struct sockaddr FAR *from, int FAR * fromlen)
 {
 	struct per_task *ppt;
@@ -1319,7 +1417,6 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 	}
 	if (!pps->pdIn && (pps->iFlags & PSF_NONBLOCK))
 	{
-		FlushMessages(ppt); /* Some apps will call this in a tight loop */
 		iErrno = WSAEWOULDBLOCK;
 		return -1;
 	}
@@ -1359,6 +1456,7 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 			return -1;
 		}
 	}
+	EndBlocking(ppt);
 
 	pd = pps->pdIn;
 	if (from)
@@ -1383,7 +1481,6 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 		Notify(pps, FD_READ);
 	}
 
-	EndBlocking(ppt);
 	return len;
 }
 
@@ -1400,7 +1497,10 @@ GetPPS(fd_set *fds)
 	pps = (struct per_socket **) malloc(sizeof(struct per_socket *) *
 					    fds->fd_count);
 	if (pps == 0)
-		return (pps);
+	{
+		iErrno = WSAENOBUFS;
+		return PPS_ERROR;
+	}
 	for (i = 0; i < fds->fd_count; i++)
 	{
 		pps[i] = GetSocketInfo(fds->fd_array[i]);
@@ -1414,7 +1514,7 @@ GetPPS(fd_set *fds)
 }
 
 
-int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
+int CALLBACK _export select (int nfds, fd_set *readfds, fd_set far *writefds,
                 fd_set *exceptfds, const struct timeval far *timeout)
 {
 	struct per_task *ppt;
@@ -1441,25 +1541,27 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 	ppsWrite = GetPPS(writefds);
 	if (ppsWrite == PPS_ERROR)
 	{
-		free(ppsRead);
+		if (ppsRead)
+			free(ppsRead);
 		return -1;
 	}
 	ppsExcept = GetPPS(exceptfds);
 	if (ppsExcept == PPS_ERROR)
 	{
-		free(ppsRead);
-		free(ppsWrite);
+		if (ppsRead)
+			free(ppsRead);
+		if (ppsWrite)
+			free(ppsWrite);
 		return -1;
 	}
 		
 	while (!bOneOK && !bTimedOut && !ppt->bCancel)
 	{
-		FlushMessages(ppt);
 		if (ppsWrite)
 		{
 			for (i = 0; i < writefds->fd_count; i++)
 			{
-				if (((!ppsWrite[i]->iFlags & PSF_CONNECTING) ||
+				if ((!(ppsWrite[i]->iFlags & (PSF_CONNECTING | PSF_MUSTCONN)) ||
 				     (ppsWrite[i]->iFlags & PSF_CONNECT)) &&
 				    ppsWrite[i]->nOutstanding < MAX_OUTSTANDING)
 					bOneOK = TRUE;
@@ -1475,6 +1577,8 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 		}
 		if (timeout && GetTickCount() >= tExpire)
 			bTimedOut = TRUE;
+		else if (!bOneOK)
+			FlushMessages(ppt);
 	}
 
 	nfds = 0;
@@ -1498,7 +1602,7 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 			if (iOld != iNew)
 				writefds->fd_array[iNew] =
 						writefds->fd_array[iOld];
-			if (((!ppsWrite[iOld]->iFlags & PSF_CONNECTING) ||
+			if ((!(ppsWrite[iOld]->iFlags & (PSF_CONNECTING | PSF_MUSTCONN)) ||
 				     (ppsWrite[iOld]->iFlags & PSF_CONNECT)) &&
 				    ppsWrite[iOld]->nOutstanding < MAX_OUTSTANDING)
 				iNew++;
@@ -1540,7 +1644,7 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
  * This causes certain FTP clients to display phenomenal transfer rates.
  * They should be checking the transfer rates *after* closing their sockets.
  */
-int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
+int CALLBACK _export send (SOCKET s, const char FAR * buf, int len, int flags)
 {
 	struct per_task *ppt;
 	struct per_socket *pps;
@@ -1556,7 +1660,6 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 	if ((pps->iFlags & PSF_CONNECTING) &&
 	    !(pps->iFlags & PSF_CONNECT))
 	{
-		FlushMessages(ppt); /* Some apps will call this in a tight loop */
 		iErrno = WSAEWOULDBLOCK;
 		return -1;
 	}
@@ -1579,7 +1682,6 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 	{
 		if (pps->iFlags & PSF_NONBLOCK)
 		{
-			FlushMessages(ppt); /* Some apps will call this in a tight loop */
 			iErrno = WSAEWOULDBLOCK;
 			return -1;
 		}
@@ -1611,7 +1713,7 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 	return len;
 }
 
-int pascal far _export sendto (SOCKET s, const char FAR * buf, int len, int flags,
+int CALLBACK _export sendto (SOCKET s, const char FAR * buf, int len, int flags,
                        const struct sockaddr FAR *to, int tolen)
 {
 	struct per_task *ppt;
@@ -1630,7 +1732,6 @@ int pascal far _export sendto (SOCKET s, const char FAR * buf, int len, int flag
 	{
 		if (pps->iFlags & PSF_NONBLOCK)
 		{
-			FlushMessages(ppt); /* Some apps will call this in a tight loop */
 			iErrno = WSAEWOULDBLOCK;
 			return -1;
 		}
@@ -1696,10 +1797,9 @@ int pascal far _export sendto (SOCKET s, const char FAR * buf, int len, int flag
 	return len;
 }
 
-int pascal far _export setsockopt (SOCKET s, int level, int optname,
+int CALLBACK _export setsockopt (SOCKET s, int level, int optname,
                            const char FAR * optval, int optlen)
 {
-	struct per_task *ppt;
 	int	nReturn;
 	struct	func_arg pfaArgs[5];
 	struct	func_arg pfaReturn;
@@ -1709,7 +1809,7 @@ int pascal far _export setsockopt (SOCKET s, int level, int optname,
 
 	iOptLen = sizeof(long);
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if ( GetTaskInfo() == 0)
 		return -1;
 	if (!GetSocketInfo(s))
 		return -1;
@@ -1744,16 +1844,15 @@ int pascal far _export setsockopt (SOCKET s, int level, int optname,
 	return 0;
 }
 
-int pascal far _export shutdown (SOCKET s, int how)
+int CALLBACK _export shutdown (SOCKET s, int how)
 {
-	struct per_task *ppt;
 	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[2];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
@@ -1761,32 +1860,56 @@ int pascal far _export shutdown (SOCKET s, int how)
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&how,		sizeof(how)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Shutdown, 2, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	if (nReturn != -1 && (how == 0 || how == 2))
-		pps->iFlags |= PSF_SHUTDOWN;
-	return nReturn;
+	RemoveTXQ(TransmitFunction(&tf));
+	pps->iFlags |= PSF_SHUTDOWN;
+	return 0;
 }
 
-SOCKET pascal far _export socket (int af, int type, int protocol)
+SOCKET CALLBACK _export socket (int af, int type, int protocol)
 {
 	struct per_task *ppt;
 	int	nReturn;
-	struct	func_arg pfaArgs[3];
+	struct	func_arg pfaArgs[4];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 	struct	per_socket *pps;
+	int	iSocket;
 
+	if (af != AF_INET)
+	{
+		iErrno = WSAEAFNOSUPPORT;
+		return (SOCKET) SOCKET_ERROR;
+	}
+	if (type != SOCK_STREAM && type != SOCK_DGRAM)
+	{
+		iErrno = WSAESOCKTNOSUPPORT;
+		return (SOCKET) SOCKET_ERROR;
+	}
+	if (protocol != 0 &&
+	    (type == SOCK_STREAM && protocol != 6) &&
+	    (type == SOCK_DGRAM && protocol != 17))
+	{
+		iErrno = WSAEPROTONOSUPPORT;
+		return (SOCKET) SOCKET_ERROR;
+	}
 	if ((ppt = GetTaskInfo()) == 0)
 		return (INVALID_SOCKET);
-	INIT_ARGS(pfaArgs[0],	AT_Int,		&af,		sizeof(af)		);
-	INIT_ARGS(pfaArgs[1],	AT_Int,		&type,		sizeof(type)		);
-	INIT_ARGS(pfaArgs[2],	AT_Int,		&protocol,	sizeof(protocol)	);
+	iSocket = GetClientSocket();
+	if (iSocket == -1)
+	{
+		iErrno = WSAENOBUFS;
+		return -1;
+	}
+	INIT_ARGS(pfaArgs[0],	AT_Int,		&iSocket,	sizeof(iSocket)		);
+	INIT_ARGS(pfaArgs[1],	AT_Int,		&af,		sizeof(af)		);
+	INIT_ARGS(pfaArgs[2],	AT_Int,		&type,		sizeof(type)		);
+	INIT_ARGS(pfaArgs[3],	AT_Int,		&protocol,	sizeof(protocol)	);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
-	INIT_TF(tf, FN_Socket, 3, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
+	INIT_TF(tf, FN_Socket, 4, pfaArgs, pfaReturn);
+	RemoveTXQ(TransmitFunction(&tf));
 	if (nReturn != -1)
 	{
-		pps = NewSocket(ppt, nReturn);
+		pps = NewSocket(ppt, iSocket);
 		switch(type)
 		{
 		case SOCK_STREAM:
@@ -1801,56 +1924,285 @@ SOCKET pascal far _export socket (int af, int type, int protocol)
 			break;
 		}
 	}
-	return nReturn;
+	return iSocket;
 }
 
-struct hostent FAR * pascal far _export gethostbyaddr(const char FAR * addr,
-                                              int len, int type)
+/* DNS Support */
+
+#define	DNS_MAXPACKET	1024
+
+static	void
+NextDNSTry(	struct per_socket *pps)
 {
-	struct per_task *ppt;
+	struct	sockaddr_in sin;
+	struct	per_task *ppt = GetAnotherTaskInfo(pps->htaskOwner);
+
+	if (pps->pdnsi->iRetry++ == 5)
+	{
+		NextDNSServer(pps);
+		return;
+	}
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(NAMESERVER_PORT);
+	memcpy(&sin.sin_addr.s_addr,
+		pps->pdnsi->aachTryNow[pps->pdnsi->iTryNow - 1],
+		4);
+	sendto(	pps->s,
+		pps->pdnsi->pchQuery,
+		pps->pdnsi->iQueryLen,
+		0,
+		&sin,
+		sizeof(sin));
+	SetTimer(ppt->hwndDNS, pps->s, 5000, 0);
+}
+
+static	void
+NextDNSServer(	struct per_socket *pps)
+{
+	if (pps->pdnsi->iTryNow == pps->pdnsi->nTryNow)
+	{
+		pps->pdnsi->bComplete = TRUE;
+		pps->pdnsi->iError = WSATRY_AGAIN;
+		return;
+	}
+	pps->pdnsi->iTryNow++;
+	pps->pdnsi->iRetry = 0;
+	NextDNSTry(pps);
+}
+
+static	void
+StartDNSLevel(	struct	per_socket *pps,
+		char	(*ppchAddresses)[4],
+		int	nAddresses)
+{
+	int	i;
+
+	for (i = 0; i < nAddresses && i < MAX_DNS_SERVERS; i++)
+		memcpy(pps->pdnsi->aachTryNow[i], ppchAddresses[i], 4);
+	pps->pdnsi->nTryNow = i;
+	pps->pdnsi->iTryNow = 0;
+	NextDNSServer(pps);
+}
+
+static	struct per_socket *
+SendDNSQuery(	char	const	*pchName,
+		BOOL	bNameToAddress)
+{
+	SOCKET	s;
+	struct per_socket *pps;
+	dns_info *pdnsi;
+	struct	sockaddr_in sin;
+	int	iLen;
+	int	nReturn;
 	struct	func_arg pfaArgs[3];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
 
+	res_init();
+	/* Create a socket, and bind it to a port. We don't care which
+	 * port, so we don't wait for the result of the bind.
+	 */
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	iLen = sizeof(sin);
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
+	INIT_ARGS(pfaArgs[1],	AT_GenPtr,	&sin,		iLen			);
+	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&iLen,		sizeof(iLen)		);
+	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
+	INIT_TF(tf, FN_Bind, 3, pfaArgs, pfaReturn);
+	RemoveTXQ(TransmitFunction(&tf));
+	pps = GetSocketInfo(s);
+
+	pps->pdnsi = pdnsi = (dns_info *) malloc(sizeof(dns_info));
+	pdnsi->bNameToAddress = bNameToAddress;
+	pdnsi->bVirtualCircuit = FALSE;
+	pdnsi->bComplete = FALSE;
+	pdnsi->hwndNotify = 0;
+	pdnsi->pchLocation = 0;
+	pdnsi->wMsg = 0;
+	pdnsi->idRequest = idNext++;
+	pdnsi->pchQuery = (char *) malloc(DNS_MAXPACKET);
+	pdnsi->iQueryLen = res_mkquery(	QUERY,
+					pchName,
+					C_IN,
+					bNameToAddress ? T_A : T_PTR,
+					0, 0, 0,
+					pdnsi->pchQuery,
+					DNS_MAXPACKET);
+	pdnsi->idSent = _res.id;
+	StartDNSLevel(	pps,
+			_res.nsaddr_list,
+			_res.nscount);
+	return pps;
+}
+
+/* We have received a response */
+static	void
+ContinueDNSQuery(struct per_socket *pps)
+{
+	struct data *pd = pps->pdIn;
+	dns_info *pdnsi = pps->pdnsi;
+	int	i;
+	int	iError;
+	struct	per_task *ppt;
+	HEADER *ph = (HEADER *) pd->pchData;
+	int	nLen;
+
+	if (!pd || !pdnsi)
+		return;
+	ppt = GetAnotherTaskInfo(pps->htaskOwner);
+	pps->pdIn = pd->pdNext;
+
+	KillTimer(ppt->hwndDNS, pps->s);
+	ph = (HEADER *) pd->pchData;
+	if (ntohs(ph->id) == pdnsi->idSent)
+	{
+		if (ph->rcode != NOERROR || ntohs(ph->ancount) == 0)
+		{
+			switch(ph->rcode)
+			{
+			case NXDOMAIN:
+				iError = WSAHOST_NOT_FOUND;
+				break;
+
+			case SERVFAIL:
+				iError = WSATRY_AGAIN;
+				break;
+
+			case NOERROR:
+				iError = WSANO_DATA;
+				break;
+
+			case FORMERR:
+			case NOTIMP:
+			case REFUSED:
+			default:
+				iError = WSANO_RECOVERY;
+				break;
+			}
+		}
+		else
+		{
+			iError = 0;
+			getanswer((querybuf *) pd->pchData,
+				pd->iLen,
+				pdnsi->bNameToAddress ? 0 : 1,
+				&ppt->he,
+				ppt->achHostEnt,
+				sizeof(ppt->achHostEnt),
+				ppt->apchHostAddresses,
+				ppt->apchHostAlii,
+				&iError);
+			if (!iError)
+			{
+				if (!pdnsi->bNameToAddress)
+				{
+					memcpy(ppt->achRevAddress, pdnsi->achInput, 4);
+					ppt->he.h_addr_list = ppt->apchHostAddresses;
+					ppt->he.h_addr_list[0] = ppt->achRevAddress;
+					ppt->he.h_addr_list[1] = 0;
+					ppt->he.h_addrtype = PF_INET;
+					ppt->he.h_length = 4;
+				}
+				if (pdnsi->hwndNotify)
+				{
+					nLen = CopyHostEntTo(ppt, pdnsi->pchLocation);
+					PostMessage(pdnsi->hwndNotify,
+						pdnsi->wMsg,
+						pdnsi->idRequest | 0x4000,
+						WSAMAKEASYNCREPLY(nLen, 0));
+				}
+			}
+		}
+		if (pdnsi->hwndNotify)
+		{
+			if (iError)
+				PostMessage(pdnsi->hwndNotify,
+					pdnsi->wMsg,
+					pdnsi->idRequest | 0x4000,
+					WSAMAKEASYNCREPLY(0, iError));
+			free(pdnsi->pchQuery);
+			free(pdnsi);
+			pps->pdnsi = 0;
+			closesocket(pps->s);
+		}
+		else
+		{
+			pdnsi->bComplete = TRUE;
+			pdnsi->iError = iError;
+		}
+	}
+}
+
+static	char	achDNSBuffer[1024];
+
+struct hostent FAR * CALLBACK _export gethostbyaddr(const char FAR * addr,
+                                              int len, int type)
+{
+	struct per_task *ppt;
+	struct per_socket *pps;
+	struct	hostent *phe;
+	int	iError;
+
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	if (!StartBlocking(ppt))
+		return 0;
 	/*
-	 * Sanity check the arguments. For the first two conditions
-	 * of this check, the WINSOCK spec does not specify the correct
-	 * iErrno value to return if they fail. Here we use EFAULT
-	 * for everything.
+	 * Sanity check the arguments.
 	 */
 	if ((type != PF_INET) ||			/* WINSOCK spec says this must be PF_INET */
 	    (len != 4) ||				/* WINSOCK spec says must be 4 for PF_INET */
 	    IsBadReadPtr(addr, len))			/* Can we read the host address */
 	{
 		iErrno = WSAEFAULT;
+		EndBlocking(ppt);
 		return 0;
 	}
-	INIT_CARGS(pfaArgs[0],	AT_GenPtr,	addr,		len			);
-	INIT_ARGS(pfaArgs[1],	AT_Int,		&len,		sizeof(len)		);
-	INIT_ARGS(pfaArgs[2],	AT_Int,		&type,		sizeof(type)		);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
-	INIT_TF(tf, FN_HostByAddr, 3, pfaArgs, pfaReturn);
-	if (TransmitFunctionAndBlock(ppt, &tf))
+	sprintf(achDNSBuffer, "%d.%d.%d.%d.in-addr.arpa",
+			(int) (unsigned char) addr[3],
+			(int) (unsigned char) addr[2],
+			(int) (unsigned char) addr[1],
+			(int) (unsigned char) addr[0]);
+	pps = SendDNSQuery(achDNSBuffer, FALSE);
+	memcpy(pps->pdnsi->achInput, addr, 4);
+	while (!pps->pdnsi->bComplete && !ppt->bCancel)
+		FlushMessages(ppt);
+	if (pps->pdnsi->bComplete)
 	{
-		CopyHostEnt(ppt);
-		return &ppt->he;
+		iError = pps->pdnsi->iError;
+		if (pps->pdnsi->iError)
+			phe = 0;
+		else
+			phe = &ppt->he;
 	}
 	else
 	{
-		return 0;
+		iError = WSAEINTR;
+		phe = 0;
 	}
+	free(pps->pdnsi->pchQuery);
+	free(pps->pdnsi);
+	pps->pdnsi = 0;
+	closesocket(pps->s);
+	EndBlocking(ppt);
+	iErrno = iError;
+	return phe;
 }
 
-struct hostent FAR * pascal far _export gethostbyname(const char FAR * name)
+struct hostent FAR * CALLBACK _export gethostbyname(const char FAR * name)
 {
 	struct per_task *ppt;
-	struct	func_arg pfaArgs[1];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
+	struct per_socket *pps;
+	struct	hostent *phe;
+	int	iError;
+	int	iLen;
 
 	if ((ppt = GetTaskInfo()) == 0)
+		return 0;
+	if (!StartBlocking(ppt))
 		return 0;
 	/*
 	 * Sanity check the argument.
@@ -1858,23 +2210,44 @@ struct hostent FAR * pascal far _export gethostbyname(const char FAR * name)
 	if (IsBadReadPtr(name, 1))	/* Make sure we can read at least 1 byte */
 	{
 		iErrno = WSAEFAULT;
+		EndBlocking(ppt);
 		return 0;
 	}
-	INIT_CARGS(pfaArgs[0],	AT_String,	name,		strlen(name) + 1	);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
-	INIT_TF(tf, FN_HostByName, 1, pfaArgs, pfaReturn);
-	if (TransmitFunctionAndBlock(ppt, &tf))
+	strcpy(achDNSBuffer, name);
+	if (!strchr(achDNSBuffer, '.'))
 	{
-		CopyHostEnt(ppt);
-		return &ppt->he;
+		strcat(achDNSBuffer, ".");
+		strcat(achDNSBuffer, hostinfo.achDomainName);
+	}
+	iLen = strlen(achDNSBuffer);
+	if (iLen && achDNSBuffer[iLen - 1] == '.')
+		achDNSBuffer[iLen - 1] = 0;
+	pps = SendDNSQuery(achDNSBuffer, TRUE);
+	while (!pps->pdnsi->bComplete && !ppt->bCancel)
+		FlushMessages(ppt);
+	if (pps->pdnsi->bComplete)
+	{
+		iError = pps->pdnsi->iError;
+		if (pps->pdnsi->iError)
+			phe = 0;
+		else
+			phe = &ppt->he;
 	}
 	else
 	{
-		return 0;
+		iError = WSAEINTR;
+		phe = 0;
 	}
+	free(pps->pdnsi->pchQuery);
+	free(pps->pdnsi);
+	pps->pdnsi = 0;
+	closesocket(pps->s);
+	EndBlocking(ppt);
+	iErrno = iError;
+	return phe;
 }
 
-struct servent FAR * pascal far _export getservbyport(int port, const char FAR * proto)
+struct servent FAR * CALLBACK _export getservbyport(int port, const char FAR * proto)
 {
 	struct per_task *ppt;
 	struct	func_arg pfaArgs[2];
@@ -1909,7 +2282,7 @@ struct servent FAR * pascal far _export getservbyport(int port, const char FAR *
 	}
 }
 
-struct servent FAR * pascal far _export getservbyname(const char FAR * name,
+struct servent FAR * CALLBACK _export getservbyname(const char FAR * name,
                                               const char FAR * proto)
 {
 	struct per_task *ppt;
@@ -1936,7 +2309,7 @@ struct servent FAR * pascal far _export getservbyname(const char FAR * name,
 	}
 }
 
-struct protoent FAR * pascal far _export getprotobynumber(int proto)
+struct protoent FAR * CALLBACK _export getprotobynumber(int proto)
 {
 	struct per_task *ppt;
 	struct	func_arg pfaArgs[1];
@@ -1959,7 +2332,7 @@ struct protoent FAR * pascal far _export getprotobynumber(int proto)
 	}
 }
 
-struct protoent FAR * pascal far _export getprotobyname(const char FAR * name)
+struct protoent FAR * CALLBACK _export getprotobyname(const char FAR * name)
 {
 	struct per_task *ppt;
 	struct	func_arg pfaArgs[1];
@@ -1982,7 +2355,7 @@ struct protoent FAR * pascal far _export getprotobyname(const char FAR * name)
 	}
 }
 
-int pascal far _export
+int CALLBACK _export
 gethostname(char *name, int namelen)
 {
 	struct per_task *ppt;
@@ -1990,9 +2363,28 @@ gethostname(char *name, int namelen)
 	struct	func_arg pfaArgs[2];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
+	int	nChars;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return -1;
+
+	nChars = strlen(hostinfo.achHostName);
+	if (nChars)
+	{
+		if (namelen <= nChars)
+		{
+			iErrno = WSAEFAULT;
+			return -1;
+		}
+		memcpy(name, hostinfo.achHostName, nChars);
+		name[nChars] = 0;
+		return 0;
+	}
+
+	/* Fallback - we didn't get it from tshost. This should never happen.
+	 * If tshost doesn't transmit it, it is too old and won't work with
+	 * this version of TwinSock anyway.
+	 */
 	INIT_ARGS(pfaArgs[0],	AT_String,	name,		namelen		);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&namelen,	sizeof(namelen)	);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
@@ -2001,44 +2393,97 @@ gethostname(char *name, int namelen)
 	return nReturn;
 }
 
-int pascal far _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
+LRESULT	CALLBACK _export
+TimerWindowProc(HWND	hWnd,
+		UINT	wMsg,
+		WPARAM	wParam,
+		LPARAM	lParam)
+{
+	if (wMsg == WM_TIMER)
+	{
+		struct per_socket *pps;
+
+		KillTimer(hWnd, wParam);
+		pps = GetSocketInfo(wParam);
+		NextDNSTry(pps);
+		return 0;
+	}
+	return DefWindowProc(hWnd, wMsg, wParam, lParam);
+}
+
+int CALLBACK _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
 {
 	struct	per_task	*pptNew;
+	tws_client	*pClient = (tws_client *) malloc(sizeof(tws_client));
+	BOOL	bOK;
+	WNDCLASS wc;
 
 	lpWSAData->wVersion = 0x0101;
 	lpWSAData->wHighVersion = 0x0101;
 	strcpy(lpWSAData->szDescription,
-		"TwinSock 1.4 - Proxy sockets system. "
-		"Copyright 1994-1995 Troy Rollo. "
-		"TwinSock is free software. "
-		"See the file \"COPYING\" from the "
-		"distribution for details.");
-	if (!hwndManager)
-		strcpy(lpWSAData->szSystemStatus, "Not Initialised.");
-	else if (bEstablished)
-		strcpy(lpWSAData->szSystemStatus, "Ready.");
+		"TwinSock 2.0");
+	bOK = StartDDE(pClient, hInstance);
+	if (bOK)
+	{
+		strcpy(lpWSAData->szSystemStatus, "Ready");
+	}
 	else
-		strcpy(lpWSAData->szSystemStatus, "Initialising.");
+	{
+		free(pClient);
+		strcpy(lpWSAData->szSystemStatus, "Not Ready");
+	}
 	lpWSAData->iMaxSockets = 256;
 	lpWSAData->iMaxUdpDg = 512;
 	lpWSAData->lpVendorInfo = 0;
 	if (wVersionRequired == 0x0001)
 		return WSAVERNOTSUPPORTED;
-	if (!bEstablished)
+	if (!bOK)
 		return WSASYSNOTREADY;
 	pptNew = malloc(sizeof(struct per_task));
 	if (pptNew == 0)
 		return (WSAENOBUFS);
+
+	memset(&wc, 0, sizeof(wc));
+	wc.style = 0;
+	wc.lpfnWndProc = TimerWindowProc;
+	wc.cbWndExtra = sizeof(struct per_task *);
+	wc.hInstance = hInstance;
+	wc.lpszClassName = "TwinSock Timer Window";
+	RegisterClass(&wc);
+
+	pptNew->hwndDNS = CreateWindow(	"TwinSock Timer Window",
+					"",
+					WS_OVERLAPPEDWINDOW,
+					0,
+					0,
+					100,
+					100,
+					0,
+					0,
+					hInstance,
+					0
+				);
+	if (!pptNew->hwndDNS)
+	{
+		free(pptNew);
+		return 0;
+	}
+
+#ifdef __FLAT__
+	pptNew->htask = 0;
+#else
 	pptNew->htask = GetCurrentTask();
+#endif
 	pptNew->pptNext = pptList;
-	pptNew->lpBlockFunc = 0;
+	pptNew->lpBlockFunc = DefBlockFunc;
 	pptNew->bCancel = FALSE;
 	pptNew->bBlocking = FALSE;
+	pptNew->pClient = pClient;
 	pptList = pptNew;
 	return 0;
 }
 
-int pascal far _export WSACleanup(void)
+int CALLBACK _export WSACleanup(void)
 {
 	struct	per_task *ppt;
 
@@ -2049,23 +2494,24 @@ int pascal far _export WSACleanup(void)
 		iErrno = WSAEINPROGRESS;
 		return -1;
 	}
+	StopDDE(ppt->pClient);
 	RemoveTask(ppt);
 	return 0;
 }
 
-void pascal far _export WSASetLastError(int iError)
+void CALLBACK _export WSASetLastError(int iError)
 {
 	if (!GetTaskInfo())
 		return;
 	iErrno = iError;
 }
 
-int pascal far _export WSAGetLastError(void)
+int CALLBACK _export WSAGetLastError(void)
 {
 	return iErrno;
 }
 
-BOOL pascal far _export WSAIsBlocking(void)
+BOOL CALLBACK _export WSAIsBlocking(void)
 {
 	struct per_task *ppt;
 
@@ -2074,17 +2520,17 @@ BOOL pascal far _export WSAIsBlocking(void)
 	return ppt->bBlocking;
 }
 
-int pascal far _export WSAUnhookBlockingHook(void)
+int CALLBACK _export WSAUnhookBlockingHook(void)
 {
 	struct	per_task *ppt;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return -1;
-	ppt->lpBlockFunc = 0;
+	ppt->lpBlockFunc = DefBlockFunc;
 	return 0;
 }
 
-FARPROC pascal far _export WSASetBlockingHook(FARPROC lpBlockFunc)
+FARPROC CALLBACK _export WSASetBlockingHook(FARPROC lpBlockFunc)
 {
 	struct per_task *ppt;
 	FARPROC oldfunc;
@@ -2097,7 +2543,7 @@ FARPROC pascal far _export WSASetBlockingHook(FARPROC lpBlockFunc)
 	return (oldfunc);	/* Return the previous value */
 }
 
-int pascal far _export WSACancelBlockingCall(void)
+int CALLBACK _export WSACancelBlockingCall(void)
 {
 	struct	per_task *ppt;
 
@@ -2148,8 +2594,7 @@ FireAsyncRequest(struct tx_queue *ptxq)
 	{
 	case FN_HostByName:
 	case FN_HostByAddr:
-		memcpy(ppt->achHostEnt, pchData, MAX_HOST_ENT);
-		nLen = CopyHostEntTo(ppt, ptxq->pchLocation);
+		/* It doesn't come here anymore */
 		break;
 
 	case FN_ServByName:
@@ -2170,7 +2615,8 @@ FireAsyncRequest(struct tx_queue *ptxq)
 	RemoveTXQ(ptxq);
 }
 
-HANDLE pascal far _export WSAAsyncGetServByName(HWND hWnd, u_int wMsg,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetServByName(HWND hWnd, u_int wMsg,
                                         const char FAR * name,
 					const char FAR * proto,
                                         char FAR * buf, int buflen)
@@ -2195,10 +2641,11 @@ HANDLE pascal far _export WSAAsyncGetServByName(HWND hWnd, u_int wMsg,
 	txq->wMsg = wMsg;
 	txq->ft = FN_ServByName;
 	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	return (HANDLE) (txq->id | 0x4000);
 }
 
-HANDLE pascal far _export WSAAsyncGetServByPort(HWND hWnd, u_int wMsg, int port,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetServByPort(HWND hWnd, u_int wMsg, int port,
                                         const char FAR * proto, char FAR * buf,
                                         int buflen)
 {
@@ -2223,10 +2670,11 @@ HANDLE pascal far _export WSAAsyncGetServByPort(HWND hWnd, u_int wMsg, int port,
 	txq->wMsg = wMsg;
 	txq->ft = FN_ServByPort;
 	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	return (HANDLE) (txq->id | 0x4000);
 }
 
-HANDLE pascal far _export WSAAsyncGetProtoByName(HWND hWnd, u_int wMsg,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetProtoByName(HWND hWnd, u_int wMsg,
                                          const char FAR * name, char FAR * buf,
                                          int buflen)
 {
@@ -2247,10 +2695,11 @@ HANDLE pascal far _export WSAAsyncGetProtoByName(HWND hWnd, u_int wMsg,
 	txq->wMsg = wMsg;
 	txq->ft = FN_ProtoByName;
 	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	return (HANDLE) (txq->id | 0x4000);
 }
 
-HANDLE pascal far _export WSAAsyncGetProtoByNumber(HWND hWnd, u_int wMsg,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetProtoByNumber(HWND hWnd, u_int wMsg,
                                            int number, char FAR * buf,
                                            int buflen)
 {
@@ -2271,64 +2720,92 @@ HANDLE pascal far _export WSAAsyncGetProtoByNumber(HWND hWnd, u_int wMsg,
 	txq->wMsg = wMsg;
 	txq->ft = FN_ProtoByNumber;
 	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	return (HANDLE) (txq->id | 0x4000);
 }
 
-HANDLE pascal far _export WSAAsyncGetHostByName(HWND hWnd, u_int wMsg,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetHostByName(HWND hWnd, u_int wMsg,
                                         const char FAR * name, char FAR * buf,
                                         int buflen)
 {
 	struct per_task *ppt;
-	struct	func_arg pfaArgs[1];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
-	struct	tx_queue *txq;
+	struct per_socket *pps;
+	struct	hostent *phe;
+	int	iError;
+	int	iLen;
+	dns_info *pdnsi;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
-	INIT_CARGS(pfaArgs[0],	AT_GenPtr,	name,		strlen(name) + 1	);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
-	INIT_TF(tf, FN_HostByName, 1, pfaArgs, pfaReturn);
-	txq = TransmitFunction(&tf);
-	txq->hwnd = hWnd;
-	txq->pchLocation = buf;
-	txq->wMsg = wMsg;
-	txq->ft = FN_HostByName;
-	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	/*
+	 * Sanity check the argument.
+	 */
+	if (IsBadReadPtr(name, 1))	/* Make sure we can read at least 1 byte */
+	{
+		iErrno = WSAEFAULT;
+		return 0;
+	}
+	strcpy(achDNSBuffer, name);
+	if (!strchr(achDNSBuffer, '.'))
+	{
+		strcat(achDNSBuffer, ".");
+		strcat(achDNSBuffer, hostinfo.achDomainName);
+	}
+	iLen = strlen(achDNSBuffer);
+	if (iLen && achDNSBuffer[iLen - 1] == '.')
+		achDNSBuffer[iLen - 1] = 0;
+	pps = SendDNSQuery(achDNSBuffer, TRUE);
+	pdnsi = pps->pdnsi;
+	pdnsi->hwndNotify = hWnd;
+	pdnsi->pchLocation = buf;
+	pdnsi->wMsg = wMsg;
+	return (HANDLE) (pdnsi->idRequest | 0x4000);
 }
 
-HANDLE pascal far _export WSAAsyncGetHostByAddr(HWND hWnd, u_int wMsg,
+#pragma argsused
+HANDLE CALLBACK _export WSAAsyncGetHostByAddr(HWND hWnd, u_int wMsg,
                                         const char FAR * addr, int len, int type,
                                         char FAR * buf, int buflen)
 {
 	struct per_task *ppt;
-	struct	func_arg pfaArgs[3];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
-	struct	tx_queue *txq;
+	struct per_socket *pps;
+	struct	hostent *phe;
+	int	iError;
+	dns_info *pdnsi;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
-	INIT_CARGS(pfaArgs[0],	AT_GenPtr,	addr,		len			);
-	INIT_CARGS(pfaArgs[1],	AT_Int,		&len,		sizeof(len)		);
-	INIT_CARGS(pfaArgs[2],	AT_Int,		&type,		sizeof(type)		);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
-	INIT_TF(tf, FN_HostByAddr, 3, pfaArgs, pfaReturn);
-	txq = TransmitFunction(&tf);
-	txq->hwnd = hWnd;
-	txq->pchLocation = buf;
-	txq->wMsg = wMsg;
-	txq->ft = FN_HostByAddr;
-	txq->htask = ppt->htask;
-	return (txq->id | 0x4000);
+	/*
+	 * Sanity check the arguments.
+	 */
+	if ((type != PF_INET) ||			/* WINSOCK spec says this must be PF_INET */
+	    (len != 4) ||				/* WINSOCK spec says must be 4 for PF_INET */
+	    IsBadReadPtr(addr, len))			/* Can we read the host address */
+	{
+		iErrno = WSAEFAULT;
+		return 0;
+	}
+	sprintf(achDNSBuffer, "%d.%d.%d.%d.in-addr.arpa",
+			(int) (unsigned char) addr[3],
+			(int) (unsigned char) addr[2],
+			(int) (unsigned char) addr[1],
+			(int) (unsigned char) addr[0]);
+	pps = SendDNSQuery(achDNSBuffer, FALSE);
+	pdnsi = pps->pdnsi;
+	memcpy(pdnsi->achInput, addr, 4);
+	pdnsi->hwndNotify = hWnd;
+	pdnsi->pchLocation = buf;
+	pdnsi->wMsg = wMsg;
+	return (HANDLE) (pdnsi->idRequest | 0x4000);
 }
 
-int pascal far _export WSACancelAsyncRequest(HANDLE hAsyncTaskHandle)
+int CALLBACK _export WSACancelAsyncRequest(HANDLE hAsyncTaskHandle)
 {
 	struct	tx_queue *ptxq;
+	struct	per_socket *pps;
+	struct	per_task *ppt;
 
-	if (!GetTaskInfo())
+	if ((ppt = GetTaskInfo()) == 0)
 		return -1;
 
 	for (ptxq = ptxqList; ptxq; ptxq = ptxq->ptxqNext)
@@ -2339,17 +2816,30 @@ int pascal far _export WSACancelAsyncRequest(HANDLE hAsyncTaskHandle)
 			return 0;
 		}
 	}
+	for (pps = ppsList; pps; pps++)
+	{
+		if (pps->htaskOwner == ppt->htask &&
+		    pps->pdnsi &&
+		    (HANDLE) (pps->pdnsi->idRequest | 0x4000) == hAsyncTaskHandle)
+		{
+			KillTimer(ppt->hwndDNS, pps->s);
+			free(pps->pdnsi->pchQuery);
+			free(pps->pdnsi);
+			pps->pdnsi = 0;
+			closesocket(pps->s);
+			return 0;
+		}
+	}
 	iErrno = WSAEINVAL;
 	return -1;
 }
 
-int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
+int CALLBACK _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
                                long lEvent)
 {
-	struct	per_task *ppt;
 	struct	per_socket *pps;
 
-	if ((ppt = GetTaskInfo()) == 0)
+	if (GetTaskInfo() == 0)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
@@ -2370,7 +2860,7 @@ int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
 	return 0;
 }
 
-int FAR PASCAL _export __WSAFDIsSet(SOCKET s, fd_set FAR *pfds)
+int CALLBACK _export __WSAFDIsSet(SOCKET s, fd_set FAR *pfds)
 {
 	u_short	i;
 

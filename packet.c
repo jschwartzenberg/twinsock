@@ -13,7 +13,8 @@
  */
 
 #include <stdio.h>
-#ifdef __MSDOS__
+#include <ctype.h>
+#ifdef _Windows
 #include <winsock.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,7 @@
 #include "twinsock.h"
 
 #define	MAX_STREAMS	256
-#define	WINDOW_SIZE	4
+#define	WINDOW_SIZE	8
 
 short	nInSeq = 0;
 short	nOutSeq = 0;
@@ -276,12 +277,12 @@ int	TransmitData(void *pvData, int iDataLen)
 				strcpy(pchDataOut + iOut, "@X");
 				iOut += 2;
 			}
-			else if (eLine == E_8NoX && c == '\023')
+			else if ((eLine == E_8NoX || eLine == E_8NoHiX) && c == '\023')
 			{
 				strcpy(pchDataOut + iOut, "@S");
 				iOut += 2;
 			}
-			else if (eLine == E_8NoX && c == '\021')
+			else if ((eLine == E_8NoX || eLine == E_8NoHiX) && c == '\021')
 			{
 				strcpy(pchDataOut + iOut, "@Q");
 				iOut += 2;

@@ -1,0 +1,11 @@
+[Options]
+Contents=Contents
+Title=TwinSock 2.0 Help
+
+[Config]
+BrowseButtons()
+
+[Files]
+TWINSOCK.RTF
+CORVU.RTF
+
