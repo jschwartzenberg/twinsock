@@ -1,0 +1,4 @@
+CFLAGS=-g
+
+tshost: packet.o tshost.o term.o commands.o
+	cc $(CFLAGS) -o tshost packet.o tshost.o term.o commands.o
