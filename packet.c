@@ -1,21 +1,15 @@
 /*
  *  TwinSock - "Troy's Windows Sockets"
  *
- *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
+ *  Copyright (C) 1994-1995  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <stdio.h>
@@ -27,12 +21,21 @@
 #include <netinet/in.h>
 #endif
 #include "packet.h"
+#include "twinsock.h"
 
 #define	MAX_STREAMS	256
 #define	WINDOW_SIZE	4
 
 short	nInSeq = 0;
 short	nOutSeq = 0;
+
+long	nCRCErrors = 0;
+long	nRetransmits = 0;
+long	nTimeouts = 0;
+long	nInsane = 0;
+long	nIncomplete = 0;
+
+enum Encoding eLine = E_6Bit;
 
 extern	int	SendData(void	*pvData, int nBytes);
 
@@ -152,43 +155,88 @@ int	TransmitData(void *pvData, int iDataLen)
 	int	nDataOut;
 	char	cNow, cTmp;
 
-	nDataOut = iDataLen * 4 / 3 + 1;
-	if (iDataLen % 6)
-		nDataOut++;
 	pchDataIn = (char *) pvData;
-	pchDataOut = (char *) malloc(nDataOut);
+	pchDataOut = (char *) malloc(iDataLen * 2 + 1); /* Worst case */
 	nBits = nBitsLeft = 0;
 	cNow = 0;
-	pchDataOut[0] = '@';	/* Signals the receiving end to realign to bit 0 */
-	for (iIn = 0, iOut = 1; iOut < nDataOut;)
+	switch(eLine)
 	{
-		if (nBitsLeft)
+	case E_6Bit:
+		nDataOut = iDataLen * 4 / 3 + 1;
+		if (iDataLen % 6)
+			nDataOut++;
+		pchDataOut[0] = '@';	/* Signals the receiving end to realign to bit 0 */
+		for (iIn = 0, iOut = 1; iOut < nDataOut;)
 		{
-			cTmp = c & ((1 << nBitsLeft) - 1);
-			nBitsNow = 6 - nBits;
-			if (nBitsLeft < nBitsNow)
-				nBitsNow = nBitsLeft;
-			cNow <<= nBitsNow;
-			cTmp >>= nBitsLeft - nBitsNow;
-			cTmp &= ((1 << nBitsNow) - 1);
-			cNow |= cTmp;
-			nBits += nBitsNow;
-			nBitsLeft -= nBitsNow;
-			if (nBits == 6)
+			if (nBitsLeft)
 			{
-				pchDataOut[iOut++] = ach6bit[cNow];
-				cNow = 0;
-				nBits = 0;
+				cTmp = c & ((1 << nBitsLeft) - 1);
+				nBitsNow = 6 - nBits;
+				if (nBitsLeft < nBitsNow)
+					nBitsNow = nBitsLeft;
+				cNow <<= nBitsNow;
+				cTmp >>= nBitsLeft - nBitsNow;
+				cTmp &= ((1 << nBitsNow) - 1);
+				cNow |= cTmp;
+				nBits += nBitsNow;
+				nBitsLeft -= nBitsNow;
+				if (nBits == 6)
+				{
+					pchDataOut[iOut++] = ach6bit[cNow];
+					cNow = 0;
+					nBits = 0;
+				}
+			}
+			else
+			{
+				if (iIn < iDataLen)
+					c = pchDataIn[iIn++];
+				else
+					c = 0;
+				nBitsLeft = 8;
 			}
 		}
-		else
+		break;
+
+	case E_8Bit:
+	case E_8NoX:
+	case E_8NoCtrl:
+		for (iIn = 0, iOut = 0; iIn < iDataLen; iIn++)
 		{
-			if (iIn < iDataLen)
-				c = pchDataIn[iIn++];
+			c = pchDataIn[iIn];
+			if (c == '@')
+			{
+				strcpy(pchDataOut + iOut, "@ ");
+				iOut += 2;
+			}
+			else if (c == '\030')
+			{
+				strcpy(pchDataOut + iOut, "@X");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoX && c == '\023')
+			{
+				strcpy(pchDataOut + iOut, "@S");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoX && c == '\021')
+			{
+				strcpy(pchDataOut + iOut, "@Q");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoCtrl &&
+				 c >= 0 && c < '\040')
+			{
+				pchDataOut[iOut++] = '@';
+				pchDataOut[iOut++] = c + '@';
+			}
 			else
-				c = 0;
-			nBitsLeft = 8;
+			{
+				pchDataOut[iOut++] = c;
+			}
 		}
+		nDataOut = iOut;
+		break;
 	}
 	nDataOut =  SendData(pchDataOut, nDataOut);
 	free(pchDataOut);
@@ -245,8 +293,12 @@ void	TimeoutReceived(void)
 {
 	struct	packet_queue *ppq;
 
+	nTimeouts++;
 	for (ppq = ppqSent; ppq; ppq = ppq->ppqNext)
+	{
+		nRetransmits++;
 		TransmitPacket(ppq);
+	}
 }
 
 void	InitHead()
@@ -281,20 +333,22 @@ void	TransmitHead(void)
 static	void
 AckReceived(int id)
 {
-	struct packet_queue **pppq, *ppqTemp;
+	struct packet_queue **pppq, *ppq, *ppqTemp;
 
 	for (pppq = &ppqSent;
 	     *pppq && (*pppq)->idPacket != id;
 	     pppq = &(*pppq)->ppqNext);
-	if (*pppq)
+	ppq = *pppq;
+	if (ppq)
 	{
-		while (ppqSent != *pppq)
+		while (ppqSent != ppq)
 		{
 			ppqTemp = ppqSent;
 			ppqSent = ppqTemp->ppqNext;
 			ppqTemp->ppqNext = 0;
 			InsertInQueue(&ppqSent, ppqTemp);
 			TransmitPacket(ppqTemp);
+			nRetransmits++;
 		}
 		ppqTemp = ppqSent;
 		ppqSent = ppqTemp->ppqNext;
@@ -429,6 +483,7 @@ void	ProcessData(void *pvData, int nDataLen)
 
 	if (!pvData)	/* Receive timeout */
 	{
+		nIncomplete++;
 		nBytes = 0;
 		return;
 	}
@@ -453,6 +508,7 @@ void	ProcessData(void *pvData, int nDataLen)
 		id = ntohs(pkt.iPacketID);
 		if (iLen > PACKET_MAX || iLen < 0) /* Sanity check */
 		{
+			nInsane++;
 			nBytes = 0;
 			nDataLen = 0;
 			KillReceiveTimeout();
@@ -512,6 +568,7 @@ void	ProcessData(void *pvData, int nDataLen)
 				 * receive timeout because we have already
 				 * "flushed" any existing input.
 				 */
+				nCRCErrors++;
 				KillReceiveTimeout();
 				if (ppqList)
 					KillTransmitTimeout();
@@ -550,29 +607,75 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 
 	pchDataIn = (char *) pvData;
 	pchDataOut = (char *) malloc(nDataLen);
-	while (nDataLen || nBitsLeft)
+	switch(eLine)
 	{
-		if (nBitsLeft)
+	case E_6Bit:
+		while (nDataLen || nBitsLeft)
 		{
-			nBitsNow = 8 - nBits;
-			if (nBitsLeft < nBitsNow)
-				nBitsNow = nBitsLeft;
-			c <<= nBitsNow;
-			cTmp = cIn >> (nBitsLeft - nBitsNow);
-			cTmp &= ((1 << nBitsNow) - 1);
-			c |= cTmp;
-			nBits += nBitsNow;
-			nBitsLeft -= nBitsNow;
-			if (nBits == 8)
+			if (nBitsLeft)
 			{
-				pchDataOut[iOut++] = c;
-				nBits = 0;
+				nBitsNow = 8 - nBits;
+				if (nBitsLeft < nBitsNow)
+					nBitsNow = nBitsLeft;
+				c <<= nBitsNow;
+				cTmp = cIn >> (nBitsLeft - nBitsNow);
+				cTmp &= ((1 << nBitsNow) - 1);
+				c |= cTmp;
+				nBits += nBitsNow;
+				nBitsLeft -= nBitsNow;
+				if (nBits == 8)
+				{
+					pchDataOut[iOut++] = c;
+					nBits = 0;
+				}
+			}
+			else
+			{
+				cIn = *pchDataIn++;
+				nDataLen--;
+				if (cIn == '\030') /* ^X */
+				{
+					nCtlX++;
+					if (nCtlX >= 5)
+						Shutdown();
+					continue;
+				}
+				else
+				{
+					nCtlX = 0;
+				}
+				if (cIn == '@')
+				{
+					cIn = c = 0;
+					nBitsLeft = 0;
+					nBits = 0;
+				}
+				else
+				{
+					if (cIn >= 'A' && cIn <= 'Z')
+						cIn -= 'A';
+					else if (cIn >= 'a' && cIn <= 'z')
+						cIn = cIn - 'a' + 26;
+					else if (cIn >= '0' && cIn <= '9')
+						cIn = cIn - '0' + 52;
+					else if (cIn == '.')
+						cIn = 62;
+					else if (cIn == '/')
+						cIn = 63;
+					else
+						continue;
+					nBitsLeft = 6;
+				}
 			}
 		}
-		else
+		break;
+
+	case E_8Bit:
+	case E_8NoX:
+	case E_8NoCtrl:
+		while (nDataLen--)
 		{
-			cIn = *pchDataIn++;
-			nDataLen--;
+			cIn = *pchDataIn;
 			if (cIn == '\030') /* ^X */
 			{
 				nCtlX++;
@@ -584,29 +687,33 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 			{
 				nCtlX = 0;
 			}
-			if (cIn == '@')
+			if (nBits == 1)
 			{
-				cIn = c = 0;
-				nBitsLeft = 0;
+				if (cIn == ' ')
+					pchDataOut[iOut++] = '@';
+				else
+					pchDataOut[iOut++] = cIn - '@';
 				nBits = 0;
+			}
+			else if (nBits == 2)
+			{
+				pchDataOut[iOut++] = cIn | 0x80;
+			}
+			else if (nBits == 3)
+			{
+				pchDataOut[iOut++] = (cIn - '@') | 0x80;
+			}
+			else if (cIn == '@')
+			{
+				nBits = 1;
 			}
 			else
 			{
-				if (cIn >= 'A' && cIn <= 'Z')
-					cIn -= 'A';
-				else if (cIn >= 'a' && cIn <= 'z')
-					cIn = cIn - 'a' + 26;
-				else if (cIn >= '0' && cIn <= '9')
-					cIn = cIn - '0' + 52;
-				else if (cIn == '.')
-					cIn = 62;
-				else if (cIn == '/')
-					cIn = 63;
-				else
-					continue;
-				nBitsLeft = 6;
+				pchDataOut[iOut++] = *pchDataIn;
 			}
+			pchDataIn++;
 		}
+		break;
 	}
 	ProcessData(pchDataOut, iOut);
 	free(pchDataOut);

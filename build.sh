@@ -128,9 +128,18 @@ else
 	fi
 fi
 
+if [ -f /usr/include/termios.h ]
+then
+	echo "Using POSIX terminals"
+	TERM_OBJECT=pterm.o
+else
+	echo "Using BSD terminals"
+	TERM_OBJECT=term.o
+fi
+
 rm -f a.out test.c
 
-OBJECTS="tshost.o packet.o commands.o term.o $NEED_MEM"
+OBJECTS="tshost.o packet.o commands.o ${TERM_OBJECT} $NEED_MEM"
 
 echo "Building makefile"
 echo ".c.o:" > Makefile
@@ -140,7 +149,7 @@ echo "tshost: ${OBJECTS}" >> Makefile
 echo "	${CC} -o tshost ${OBJECTS} ${L_NSL} ${L_RESOLV} ${L_SOCKET}" >> Makefile
 
 echo
-echo 'Running "make"'
+echo 'Running "make -f Makefile"'
 echo
-exec make
+exec make -f Makefile
 

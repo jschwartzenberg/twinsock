@@ -4,18 +4,12 @@
  *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <sys/types.h>
@@ -28,6 +22,8 @@
 #endif
 #include "twinsock.h"
 #include "tx.h"
+
+extern	enum Encoding eLine;
 
 extern	void	PacketTransmitData(void *pvData, int iDataLen, int iStream);
 
@@ -78,15 +74,41 @@ main(int argc, char **argv)
 	struct	timeval tvZero;
 	struct	timeval tv;
 
-	fprintf(stderr, "TwinSock Host 1.1 (pre release)\n");
+	while (argc-- > 1)
+	{
+		argv++;
+		if (**argv =='-')
+		{
+			while (*++*argv)
+			{
+				switch(**argv)
+				{
+				case '8':
+					eLine = E_8Bit;
+					break;
+
+				case 'n':
+					eLine = E_8NoCtrl;
+					break;
+
+				case 'x':
+					eLine = E_8NoX;
+					break;
+				}
+			}
+		}
+	}
+
+	fprintf(stderr, "TwinSock Host 1.3\n");
 	fprintf(stderr, "Copyright 1994 Troy Rollo\n");
 	fprintf(stderr, "This program is free software\n");
 	fprintf(stderr, "See the file COPYING for details\n");
 	fprintf(stderr, "\nStart your TwinSock client now\n");
-	fprintf(stderr, "!@$TSStart$@\n");
+	fprintf(stderr, "!@$TSStart%d$@\n", (int) eLine);
 
 	if (isatty(0))
 		InitTerm();
+
 	nLargestFD = 0;
 	FD_ZERO(&fdsActive);
 	FD_ZERO(&fdsWrite);
@@ -186,7 +208,7 @@ void
 SetTransmitTimeout(void)
 {
 	KillTimer(TIMER_ID_SEND);
-	SetTimer(TIMER_ID_SEND, 3000);
+	SetTimer(TIMER_ID_SEND, 10000);
 }
 
 void
@@ -423,3 +445,4 @@ DataReceived(void *pvData, int iLen)
 		}
 	}
 }
+

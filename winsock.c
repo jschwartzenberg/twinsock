@@ -1,21 +1,15 @@
 /*
  *  TwinSock - "Troy's Windows Sockets"
  *
- *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
+ *  Copyright (C) 1994-1995  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <winsock.h>
@@ -43,13 +37,19 @@ BOOL	bEstablished = 0;
 
 static	void	FireAsyncRequest(struct tx_queue *ptxq);
 
-void _export
+int FAR PASCAL
+LibMain(HINSTANCE hInst, WORD wOne, WORD wTwo, LPSTR lpstr)
+{
+	return TRUE;
+}
+
+void far pascal _export
 RegisterManager(HWND hwnd)
 {
 	hwndManager = hwnd;
 }
 
-void _export
+void far pascal _export
 SetInitialised(void)
 {
 	bEstablished = TRUE;
@@ -100,7 +100,7 @@ CopyDataOut(	void		*pvDest,
 
 	case AT_Int32:
 	case AT_Int32Ptr:
-		*(short *) pvDest = htonl(*(short *) pvSource);
+		*(long *) pvDest = htonl(*(long *) pvSource);
 		break;
 
 	case AT_Char:
@@ -247,9 +247,9 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 			nLen -= sizeof(struct sockaddr_in);
 			pvData = (char *) pvData + sizeof(struct sockaddr_in);
 			if (nLen == sizeof(long))
-				ns = ntohl(*(long *) pvData);
+				ns = (int) ntohl(*(long *) pvData);
 			else
-				ns = ntohs(*(short*) pvData);
+				ns = (int) ntohs(*(short*) pvData);
 			SendEarlyClose(ns);
 		}
 		return;
@@ -369,11 +369,12 @@ RemoveTask(struct per_task *ppt)
 		{
 			*pppt = ppt->pptNext;
 			free(ppt);
+			break;
 		}
 	}
 };
 
-void far _export
+void far pascal _export
 ResponseReceived(struct tx_request *ptxr)
 {
 	int		nLen;
@@ -627,7 +628,7 @@ CopyHostEntTo(struct per_task *ppt, char *pchData)
 	pchOld = phe->h_addr_list[0];
 	memcpy(pchData, pchOld, 4 * nAddrs);
 	for (i = 0; i < nAddrs; i++)
-		phe->h_addr_list[i] = phe->h_addr_list[i] - pchOld + pchData;
+		phe->h_addr_list[i] =  pchData + (phe->h_addr_list[i] - pchOld);
 	pchData += 4 * nAddrs;
 
 	strcpy(pchData, phe->h_name);
@@ -705,7 +706,6 @@ CopyProtoEnt(struct per_task *ppt)
 {
 	int	iLocation;
 	int	i;
-	int	nAddrs;
 
 	ppt->pe.p_proto = ntohs(*(short *) ppt->achProtoEnt);
 	iLocation = sizeof(short);
@@ -808,7 +808,6 @@ int pascal far _export
 bind(SOCKET s, const struct sockaddr FAR *addr, int namelen)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[3];
 	struct	func_arg pfaReturn;
@@ -1672,7 +1671,7 @@ int pascal far _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
 	lpWSAData->wVersion = 0x0101;
 	lpWSAData->wHighVersion = 0x0101;
 	strcpy(lpWSAData->szDescription,
-		"TwinSock 1.1 - Proxy sockets system. "
+		"TwinSock 1.3 - Proxy sockets system. "
 		"Copyright 1994 Troy Rollo. "
 		"TwinSock is free software. "
 		"See the file \"COPYING\" from the "
@@ -1709,9 +1708,9 @@ int pascal far _export WSACleanup(void)
 	if (ppt->bBlocking)
 	{
 		iErrno = WSAEINPROGRESS;
-		RemoveTask(ppt);
 		return -1;
 	}
+	RemoveTask(ppt);
 	return 0;
 }
 
@@ -2027,7 +2026,7 @@ int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
 	return 0;
 }
 
-int FAR PASCAL _export _WSAFDIsSet(SOCKET s, fd_set FAR *pfds)
+int FAR PASCAL _export __WSAFDIsSet(SOCKET s, fd_set FAR *pfds)
 {
 	int	i;
 

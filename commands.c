@@ -1,21 +1,15 @@
 /*
  *  TwinSock - "Troy's Windows Sockets"
  *
- *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
+ *  Copyright (C) 1994-1995  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 #include <stdio.h>
@@ -34,6 +28,192 @@ extern int h_errno;
 #ifdef NO_H_ERRNO
 #define h_errno errno
 #endif
+
+#ifndef AF_UNSPEC
+#define	AF_UNSPEC	0
+#endif
+#ifndef AF_UNIX
+#define AF_UNIX		-1
+#endif
+#ifndef AF_INET
+#define AF_INET		-1
+#endif
+#ifndef AF_IMPLINK
+#define AF_IMPLINK      -1
+#endif
+#ifndef AF_PUP
+#define AF_PUP          -1
+#endif
+#ifndef AF_CHAOS
+#define AF_CHAOS        -1
+#endif
+#ifndef AF_NS
+#define AF_NS          -1
+#endif
+#ifndef AF_ISO
+#define AF_ISO          -1
+#endif
+#ifndef AF_ECMA
+#define AF_ECMA         -1
+#endif
+#ifndef AF_DATAKIT
+#define AF_DATAKIT      -1
+#endif
+#ifndef AF_CCITT
+#define AF_CCITT        -1
+#endif
+#ifndef AF_SNA
+#define AF_SNA          -1
+#endif
+#ifndef AF_DECnet
+#define AF_DECnet       -1
+#endif
+#ifndef AF_DLI
+#define AF_DLI          -1
+#endif
+#ifndef AF_LAT
+#define AF_LAT          -1
+#endif
+#ifndef AF_HYLINK
+#define AF_HYLINK       -1
+#endif
+#ifndef AF_APPLETALK
+#define AF_APPLETALK    -1
+#endif
+#ifndef AF_NETBIOS
+#define AF_NETBIOS    -1
+#endif
+
+#define	rangeof(x)	(sizeof(x) / sizeof(x[0]))
+
+static int HostSocketFamily[] =
+{
+	AF_UNSPEC,	                /* unspecified */
+	AF_UNIX,	                /* local to host (pipes, portals) */
+	AF_INET,	                /* internetwork: UDP, TCP, etc. */
+	AF_IMPLINK,	                /* arpanet imp addresses */
+	AF_PUP,	 	                /* pup protocols: e.g. BSP */
+	AF_CHAOS,	                /* mit CHAOS protocols */
+	AF_NS,	 	                /* NS, IPX and SPX */
+	AF_ISO,	 	                /* ISO protocols */
+	AF_ECMA,	                /* european computer manufacturers */
+	AF_DATAKIT,	                /* datakit protocols */
+	AF_CCITT,	                /* CCITT protocols, X.25 etc */
+	AF_SNA,	                        /* IBM SNA */
+	AF_DECnet,	                /* DECnet */
+	AF_DLI,	                        /* Direct data link interface */
+	AF_LAT,	                        /* LAT */
+	AF_HYLINK,	                /* NSC Hyperchannel */
+	AF_APPLETALK,	                /* AppleTalk */
+	AF_NETBIOS	                /* NetBios-style addresses */
+};
+
+static int HostSocketType[] =
+{
+	0,
+	SOCK_STREAM,
+	SOCK_DGRAM,
+	SOCK_RAW,
+        SOCK_RDM,
+	SOCK_SEQPACKET
+};
+
+#ifndef IPPROTO_IP
+#define IPPROTO_IP 0
+#endif
+#ifndef IPPROTO_ICMP
+#define IPPROTO_ICMP 1
+#endif
+#ifndef IPPROTO_GGP
+#define IPPROTO_GGP 2
+#endif
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+#ifndef IPPROTO_PUP
+#define IPPROTO_PUP 12
+#endif
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 18
+#endif
+#ifndef IPPROTO_ND
+#define IPPROTO_ND 77
+#endif
+
+static int HostSocketProtocol[] =
+{
+	IPPROTO_IP, IPPROTO_ICMP, IPPROTO_GGP, 3, 4,
+	5, IPPROTO_TCP, 7, 8, 9,
+	10, 11, IPPROTO_PUP, 13, 14, 15, 16, IPPROTO_UDP, 18, 19,
+	20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+	30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+	40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+	50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+	60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+	70, 71, 72, 73, 74, 75, 76, IPPROTO_ND, 78, 79
+};
+
+static struct
+{
+ int iWindows;
+ int iHost;
+} HostSocketOption[] =
+{
+	{ 0x0001,	SO_DEBUG	},
+	{ 0x0002,	SO_ACCEPTCONN	},
+	{ 0x0004,	SO_REUSEADDR	},
+	{ 0x0008,	SO_KEEPALIVE	},
+	{ 0x0010,	SO_DONTROUTE	},
+	{ 0x0020,	SO_BROADCAST	},
+	{ 0x0040,	SO_USELOOPBACK	},
+	{ 0x0080,	SO_LINGER	},
+	{ 0x0100,	SO_OOBINLINE	}
+};
+
+static int
+GetFamily(int x)
+{
+	return (x < rangeof(HostSocketFamily)) ? HostSocketFamily[x] : x;
+}
+
+static int
+RevFamily(int x)
+{
+	int i;
+
+	for (i = 0; i < rangeof(HostSocketFamily); i++)
+	{
+		if (HostSocketFamily[i] == x)
+			return i;
+	}
+	return x;
+}
+
+static int
+GetType(int x)
+{
+	return (x < rangeof(HostSocketType)) ? HostSocketType[x] : x;
+}
+
+static int
+GetProtocol(int x)
+{
+	return (x < rangeof(HostSocketProtocol)) ? HostSocketProtocol[x] : x;
+}
+
+static	int
+GetOption(int x)
+{
+	int	iOption = 0;
+	int	i;
+
+	for (i = 0; i < rangeof(HostSocketOption); i++)
+	{
+		if (x & HostSocketOption[i].iWindows)
+			iOption |= HostSocketOption[i].iHost;
+	}
+	return iOption;
+}
 
 extern void PacketTransmitData (void *pvData, int iDataLen, int iStream);
 
@@ -160,7 +340,7 @@ struct sockaddr *
 ConvertSA(struct func_arg *pfa, struct sockaddr_in *sin)
 {
 	memcpy(sin, pfa->pvData, sizeof(*sin));
-	sin->sin_family = ntohs(sin->sin_family);
+	sin->sin_family = GetFamily(ntohs(sin->sin_family));
 	return (struct sockaddr *) sin;
 }
 
@@ -354,6 +534,7 @@ ResponseReceived(struct tx_request *ptxr_)
 	int	iLen;
 	int	iValue;
 	int	iSocket;
+	int	nOptName;
 	int	nOptVal;
 	short	nError;
 	struct	tx_request *ptxr;
@@ -471,9 +652,9 @@ ResponseReceived(struct tx_request *ptxr_)
 		break;
 
 	case FN_Socket:
-		iSocket = socket(GetIntVal(&pfaArgs[0]),
-				GetIntVal(&pfaArgs[1]),
-				GetIntVal(&pfaArgs[2]));
+		iSocket = socket(GetFamily(GetIntVal(&pfaArgs[0])),
+				GetType(GetIntVal(&pfaArgs[1])),
+				GetProtocol(GetIntVal(&pfaArgs[2])));
 		SetIntVal(&faResult,iSocket);
 		if (iSocket != -1)
 		{
@@ -500,6 +681,7 @@ ResponseReceived(struct tx_request *ptxr_)
 			SetIntVal(&pfaArgs[2], iValue);
 			iValue = ((struct sockaddr *) pfaArgs[1].pvData)->
 						sa_family;
+			iValue = RevFamily(iValue);
 			iValue = htons((short) iValue);
 			((struct sockaddr *) pfaArgs[1].pvData)->sa_family =
 						(short) iValue;
@@ -517,6 +699,7 @@ ResponseReceived(struct tx_request *ptxr_)
 			SetIntVal(&pfaArgs[2], iValue);
 			iValue = ((struct sockaddr *) pfaArgs[1].pvData)->
 						sa_family;
+			iValue = RevFamily(iValue);
 			iValue = htons((short) iValue);
 			((struct sockaddr *) pfaArgs[1].pvData)->sa_family =
 						(short) iValue;
@@ -525,15 +708,16 @@ ResponseReceived(struct tx_request *ptxr_)
 
 	case FN_GetSockOpt:
 		iLen = GetIntVal(&pfaArgs[4]);
+		nOptName = GetOption(GetIntVal(&pfaArgs[2]));
 		iValue = getsockopt(	GetIntVal(&pfaArgs[0]),
 					GetIntVal(&pfaArgs[1]),
-					GetIntVal(&pfaArgs[2]),
+					nOptName,
 					(char *) pfaArgs[3].pvData,
 					&iLen);
 		if (iValue != -1)
 		{
 			SwapSockOptOut(&pfaArgs[3],
-					GetIntVal(&pfaArgs[2]));
+					nOptName);
 			SetIntVal(&pfaArgs[4], iLen);
 		}
 		SetIntVal(&faResult, iValue);
@@ -541,15 +725,16 @@ ResponseReceived(struct tx_request *ptxr_)
 
 	case FN_SetSockOpt:
 		iLen = GetIntVal(&pfaArgs[4]);
+		nOptName = GetOption(GetIntVal(&pfaArgs[2]));
 		SwapSockOptIn(&pfaArgs[3],
-				GetIntVal(&pfaArgs[2]));
+				nOptName);
 		iValue = setsockopt(	GetIntVal(&pfaArgs[0]),
 					SOL_SOCKET,
-					GetIntVal(&pfaArgs[2]),
+					nOptName,
 					(char *) pfaArgs[3].pvData,
 					iLen);
 		SwapSockOptOut(&pfaArgs[3],
-				GetIntVal(&pfaArgs[2]));
+				nOptName);
 		SetIntVal(&faResult, iValue);
 		break;
 
@@ -667,7 +852,7 @@ SendSocketData(int iSocket,
 
 	iDataLen = sizeof(struct sockaddr_in) + iLen;
 	sa = *psa;
-	sa.sin_family = htons(sa.sin_family);
+	sa.sin_family = htons(RevFamily(sa.sin_family));
 	ptxr = (struct tx_request *) malloc(sizeof(short) * 5 + iDataLen);
 	ptxr->nLen = htons(iDataLen + sizeof(short) * 5);
 	ptxr->id = htons(iSocket);

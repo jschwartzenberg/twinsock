@@ -4,18 +4,12 @@
  *  Copyright (C) 1994  Troy Rollo <troy@cbme.unsw.EDU.AU>
  *
  *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
+ *  it under the terms of the license in the file LICENSE.TXT included
+ *  with the TwinSock distribution.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
  */
 
 enum	arg_type
@@ -39,6 +33,14 @@ enum	arg_type
 	AT_IntPtr = AT_Int
 #endif
 #endif
+};
+
+enum Encoding
+{
+	E_6Bit = 0,
+	E_8Bit,
+	E_8NoCtrl,
+	E_8NoX
 };
 
 enum	Functions
@@ -159,3 +161,4 @@ struct	per_socket
 		  tf.pfaResult = &retval )
 
 #endif
+
