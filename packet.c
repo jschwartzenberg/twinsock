@@ -29,6 +29,7 @@
 #include "packet.h"
 
 #define	MAX_STREAMS	256
+#define	WINDOW_SIZE	4
 
 short	nInSeq = 0;
 short	nOutSeq = 0;
@@ -92,14 +93,21 @@ struct	packet_queue
 	int			idPacket;
 	int			iPacketLen;
 	int			iStream;
+	int			iFlags;
 	struct	packet		*pkt;
 	struct	packet_queue	*ppqNext;
 };
 
-struct	packet_queue *ppqList = 0;
-int	iInitialised = 0;
-struct	packet_queue *appqStreams[MAX_STREAMS];
-char	aiStreams[MAX_STREAMS / 8];
+#define	PQF_LEADER	0x0001
+#define	PQF_TRAILER	0x0002
+
+static	struct	packet_queue *ppqList = 0;
+static	int	iInitialised = 0;
+static	struct	packet_queue *appqStreams[MAX_STREAMS];
+static	struct	packet_queue *ppqSent = 0;
+static	int	nSent = 0;
+static	struct	packet_queue *ppqReceived = 0;
+static	char	aiStreams[MAX_STREAMS / 8];
 
 #define	STREAM_BIT(x)	(1 << (((x) + 1) % 8))
 #define	STREAM_BYTE(x)	aiStreams[((x) + 1) / 8]
@@ -109,6 +117,28 @@ char	aiStreams[MAX_STREAMS / 8];
 #define	GET_STREAM(x)	((STREAM_BYTE(x) & STREAM_BIT(x)) != 0)
 
 static	char ach6bit[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./";
+
+void	PoppedPacket(struct packet_queue *ppqPopped);
+void	PutInQueue(struct packet_queue *ppq, int iStream);
+
+void	InsertInQueue(struct packet_queue **pppqNext, struct packet_queue *ppq)
+{
+	for (; *pppqNext; pppqNext = &((*pppqNext)->ppqNext));
+	*pppqNext = ppq;
+}
+
+void	FlushQueue(struct packet_queue **pppq)
+{
+	struct	packet_queue *ppqPop;
+
+	while ((ppqPop = *pppq) != 0)
+	{
+		*pppq = ppqPop->ppqNext;
+		free(ppqPop->pkt);
+		free(ppqPop);
+	}
+}
+
 
 int	TransmitData(void *pvData, int iDataLen)
 {
@@ -165,15 +195,58 @@ int	TransmitData(void *pvData, int iDataLen)
 	return nDataOut;
 }
 
-void	TransmitHead(void)
+static	void
+TransmitPacket(struct packet_queue *ppqList)
 {
 	TransmitData(ppqList->pkt, ppqList->iPacketLen);
 	SetTransmitTimeout();
 }
 
+void
+InsertIntoIncoming(struct packet *pkt, int iLen)
+{
+	struct packet_queue *ppq;
+	struct packet_queue **pppq;
+	struct packet *pktNew;
+	int	iPacketID;
+
+	iPacketID = ntohs(pkt->iPacketID);
+
+	for (	pppq = &ppqReceived;
+		*pppq && (*pppq)->idPacket < iPacketID;
+		pppq = &(*pppq)->ppqNext);
+	if ((*pppq) && (*pppq)->idPacket == iPacketID)
+		return;
+	pktNew = (struct packet *) malloc(sizeof(struct packet));
+	*pktNew = *pkt;
+
+	ppq = (struct packet_queue *) malloc(sizeof(struct packet_queue));
+	ppq->ppqNext = *pppq;
+	ppq->idPacket = iPacketID;
+	ppq->pkt = pktNew;
+	ppq->iPacketLen = iLen;
+	*pppq = ppq;
+
+	while (ppqReceived && ppqReceived->idPacket == nInSeq)
+	{
+		nInSeq++;
+		DataReceived(ppqReceived->pkt->achData,
+			     ppqReceived->iPacketLen - sizeof(short) * 4);
+		ppq = ppqReceived;
+		ppqReceived = ppq->ppqNext;
+		free(ppq->pkt);
+		free(ppq);
+	}
+}
+
+
+
 void	TimeoutReceived(void)
 {
-	TransmitHead();
+	struct	packet_queue *ppq;
+
+	for (ppq = ppqSent; ppq; ppq = ppq->ppqNext)
+		TransmitPacket(ppq);
 }
 
 void	InitHead()
@@ -189,22 +262,56 @@ void	InitHead()
 	nOutSeq++;
 }
 
-void	InsertInQueue(struct packet_queue **pppqNext, struct packet_queue *ppq)
+void	TransmitHead(void)
 {
-	for (; *pppqNext; pppqNext = &((*pppqNext)->ppqNext));
-	*pppqNext = ppq;
+	struct packet_queue *ppq;
+
+	if (nSent < WINDOW_SIZE)
+	{
+		nSent++;
+		ppq = ppqList;
+		ppqList = ppq->ppqNext;
+		ppq->ppqNext = 0;
+		InsertInQueue(&ppqSent, ppq);
+		PoppedPacket(ppq);
+		TransmitPacket(ppq);
+	}
 }
+
+static	void
+AckReceived(int id)
+{
+	struct packet_queue **pppq, *ppqTemp;
+
+	for (pppq = &ppqSent;
+	     *pppq && (*pppq)->idPacket != id;
+	     pppq = &(*pppq)->ppqNext);
+	if (*pppq)
+	{
+		while (ppqSent != *pppq)
+		{
+			ppqTemp = ppqSent;
+			ppqSent = ppqTemp->ppqNext;
+			ppqTemp->ppqNext = 0;
+			InsertInQueue(&ppqSent, ppqTemp);
+			TransmitPacket(ppqTemp);
+		}
+		ppqTemp = ppqSent;
+		ppqSent = ppqTemp->ppqNext;
+		free(ppqTemp->pkt);
+		free(ppqTemp);
+		nSent--;
+		if (ppqList)
+			TransmitHead();
+		if (!ppqSent)
+			KillTransmitTimeout();
+	}
+}
+
 
 void	FlushStream(int	iStream)
 {
-	struct	packet_queue *ppqPop;
-
-	while ((ppqPop = appqStreams[iStream + 1]) != 0)
-	{
-		appqStreams[iStream + 1] = ppqPop->ppqNext;
-		free(ppqPop->pkt);
-		free(ppqPop);
-	}
+	FlushQueue(appqStreams + iStream + 1);
 }
 
 void	PutInQueue(struct packet_queue *ppq, int iStream)
@@ -213,7 +320,9 @@ void	PutInQueue(struct packet_queue *ppq, int iStream)
 	{
 		InsertInQueue(&ppqList, ppq);
 	}
-	else if (GET_STREAM(iStream))
+	else if (GET_STREAM(iStream) && 
+		 (appqStreams[iStream + 1] ||
+		  (ppq->iFlags & PQF_LEADER)))
 	{
 		InsertInQueue(appqStreams + iStream + 1, ppq);
 	}
@@ -229,25 +338,25 @@ void	PutInQueue(struct packet_queue *ppq, int iStream)
 	}
 }
 
-void	PopListHead(void)
+void	PoppedPacket(struct packet_queue *ppqPopped)
 {
-	int iStream;
-	struct packet_queue *ppqNext, *ppqPop;
+	int	iStream, iFlags;
+	struct	packet_queue *ppqPop;
 
-	iStream = ppqList->iStream;
-	ppqNext = ppqList->ppqNext;
-	free(ppqList->pkt);
-	free(ppqList);
-	ppqList = ppqNext;
+	iStream = ppqPopped->iStream;
+	iFlags = ppqPopped->iFlags;
 
-	if (iStream != -2)
+	if (iStream != -2 && (iFlags & PQF_TRAILER))
 	{
 		if (appqStreams[iStream + 1])
 		{
-			ppqPop = appqStreams[iStream + 1];
-			appqStreams[iStream + 1] = ppqPop->ppqNext;
-			ppqPop->ppqNext = 0;
-			InsertInQueue(&ppqList, ppqPop);
+			do
+			{
+				ppqPop = appqStreams[iStream + 1];
+				appqStreams[iStream + 1] = ppqPop->ppqNext;
+				ppqPop->ppqNext = 0;
+				InsertInQueue(&ppqList, ppqPop);
+			} while (!(ppqPop->iFlags & PQF_TRAILER));
 		}
 		else
 		{
@@ -262,7 +371,7 @@ void	PopListHead(void)
 	}
 }
 
-void	SendPacket(void	*pvData, int iDataLen, int iStream)
+void	SendPacket(void	*pvData, int iDataLen, int iStream, int iFlags)
 {
 	struct	packet	*pkt;
 	struct	packet_queue *ppq;
@@ -282,6 +391,7 @@ void	SendPacket(void	*pvData, int iDataLen, int iStream)
 	ppq->iStream = iStream;
 	ppq->pkt = pkt;
 	ppq->ppqNext = 0;
+	ppq->iFlags = iFlags;
 
 	pkt->iPacketLen = htons(iDataLen);
 	pkt->nCRC = 0;
@@ -373,20 +483,9 @@ void	ProcessData(void *pvData, int nDataLen)
 				{
 				case PT_Data:
 					iLocation = nInSeq - id;
-					if (iLocation & 0x8000)
-					{
-						/* We're in trouble */
-						Shutdown();
-					}
-					else
-					{
-						TransmitAck(id);
-						if (!iLocation)
-						{
-							nInSeq++;
-							DataReceived(pkt.achData, iLen);
-						}
-					}
+					TransmitAck(id);
+					if (iLocation <= 0)
+						InsertIntoIncoming(&pkt, iLen + sizeof(short) * 4);
 					break;
 
 				case PT_Nak:
@@ -396,12 +495,7 @@ void	ProcessData(void *pvData, int nDataLen)
 					break;
 
 				case PT_Ack:
-					if (ppqList &&
-					    id == ppqList->idPacket)
-					{
-						KillTransmitTimeout();
-						PopListHead();
-					}
+					AckReceived(id);
 					break;
 
 				case PT_Shutdown:
@@ -520,13 +614,29 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 
 void	PacketTransmitData(void *pvData, int iDataLen, int iStream)
 {
-	iStream = -2;
+	int	iFlags = PQF_LEADER;
+
 	while (iDataLen > PACKET_MAX)
 	{
-		SendPacket(pvData, PACKET_MAX, iStream);
+		SendPacket(pvData, PACKET_MAX, iStream, iFlags);
 		pvData = (char *) pvData + PACKET_MAX;
 		iDataLen -= PACKET_MAX;
+		iFlags = 0;
 	}
-	SendPacket(pvData, iDataLen, iStream);
+	iFlags |= PQF_TRAILER;
+	SendPacket(pvData, iDataLen, iStream, iFlags);
+}
+
+
+void
+ReInitPackets(void)
+{
+	int	i;
+
+	nInSeq = nOutSeq = 0;
+	for (i = 0; i < MAX_STREAMS; i++)
+		FlushQueue(appqStreams + i);
+	FlushQueue(&ppqList);
+	memset(aiStreams, 0, sizeof(aiStreams));
 }
 

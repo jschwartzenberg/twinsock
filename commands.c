@@ -28,6 +28,15 @@
 #include "tx.h"
 #include "wserror.h"
 
+#ifdef NEED_H_ERRNO
+extern int h_errno;
+#endif
+#ifdef NO_H_ERRNO
+#define h_errno errno
+#endif
+
+extern void PacketTransmitData (void *pvData, int iDataLen, int iStream);
+
 struct
 {
 	int	iErrnoHost;
@@ -85,7 +94,7 @@ struct
  * to and from unaligned addresses
  */
 
-static short
+static unsigned short
 ToShort(char *pchData)
 {
 	short	n;
@@ -104,7 +113,7 @@ ToLong(char *pchData)
 }
 
 static void
-FromShort(char *pchData, short n)
+FromShort(char *pchData, unsigned short n)
 {
 	memcpy(pchData, &n, sizeof(short));
 }
@@ -115,34 +124,34 @@ FromLong(char *pchData, long n)
 	memcpy(pchData, &n, sizeof(long));
 }
 
-static int
+static long
 GetIntVal(struct func_arg *pfa)
 {
 	switch(pfa->at)
 	{
 	case AT_Int16:
 	case AT_Int16Ptr:
-		return ToShort(pfa->pvData);
+		return ntohs(ToShort(pfa->pvData));
 
 	case AT_Int32:
 	case AT_Int32Ptr:
-		return ToLong(pfa->pvData);
+		return ntohl(ToLong(pfa->pvData));
 	}
 }
 
 void
-SetIntVal(struct func_arg *pfa, int iVal)
+SetIntVal(struct func_arg *pfa, long iVal)
 {
 	switch(pfa->at)
 	{
 	case AT_Int16:
 	case AT_Int16Ptr:
-		FromShort(pfa->pvData,(short) iVal);
+		FromShort(pfa->pvData,htons((short) iVal));
 		return;
 
 	case AT_Int32:
 	case AT_Int32Ptr:
-		FromLong(pfa->pvData, iVal);
+		FromLong(pfa->pvData, htonl((short) iVal));
 		return;
 	}
 };
@@ -395,7 +404,7 @@ ResponseReceived(struct tx_request *ptxr_)
 	case FN_Data:
 		ptxr->nError = htons(WSAEOPNOTSUPP);
 		ptxr->nLen = htons(sizeof(short) * 5);
-		PacketTransmitData(ptxr, sizeof(short) * 5, -1);
+		PacketTransmitData(ptxr, sizeof(short) * 5, -2);
 		iErrorSent = 1;
 		break;
 
@@ -475,7 +484,7 @@ ResponseReceived(struct tx_request *ptxr_)
 					SOL_SOCKET,
 					SO_OOBINLINE,
 					(char *) &nOptVal,
-					&iLen);
+					iLen);
 			errno = 0;
 		}
 		break;
@@ -538,7 +547,7 @@ ResponseReceived(struct tx_request *ptxr_)
 					SOL_SOCKET,
 					GetIntVal(&pfaArgs[2]),
 					(char *) pfaArgs[3].pvData,
-					&iLen);
+					iLen);
 		SwapSockOptOut(&pfaArgs[3],
 				GetIntVal(&pfaArgs[2]));
 		SetIntVal(&faResult, iValue);
@@ -575,7 +584,11 @@ ResponseReceived(struct tx_request *ptxr_)
 		break;
 
 	case FN_ServByPort:
-		pse = getservbyport(GetIntVal(&pfaArgs[0]),
+		if (pfaArgs[0].at == AT_Int16)
+			iValue = *(short *) pfaArgs[0].pvData;
+		else
+			iValue = *(long *) pfaArgs[0].pvData;
+		pse = getservbyport(iValue,
 				    (char *) pfaArgs[1].pvData);
 		if (pse)
 		{
@@ -630,11 +643,11 @@ ResponseReceived(struct tx_request *ptxr_)
 	}
 	if (!iErrorSent)
 	{
-		if (ft >= FN_HostByAddr || ft <= FN_ProtoByName)
+		if (ft >= FN_HostByAddr && ft <= FN_ProtoByName)
 			ptxr->nError = htons(MapHError(h_errno));
 		else
 			ptxr->nError = htons(MapError(errno));
-		PacketTransmitData(ptxr, nLen, -1);
+		PacketTransmitData(ptxr, nLen, -2);
 	}
 	free(ptxr);
 	free(pfaArgs);
@@ -646,7 +659,7 @@ SendSocketData(int iSocket,
 		int	iLen,
 		struct sockaddr_in *psa,
 		int	iAddrLen,
-		enum function_type ft)
+		enum Functions ft)
 {
 	struct	tx_request *ptxr;
 	int	iDataLen;
@@ -663,7 +676,8 @@ SendSocketData(int iSocket,
 	ptxr->iType = htons(ft);
 	memcpy(ptxr->pchData, &sa, sizeof(sa));
 	memcpy(ptxr->pchData + sizeof(sa), pvData, iLen);
-	PacketTransmitData(ptxr, sizeof(short) * 5 + iDataLen, iSocket);
+	PacketTransmitData(ptxr, sizeof(short) * 5 + iDataLen,
+		(ft == FN_Data) ? iSocket : -2);
 	free(ptxr);
 }
 

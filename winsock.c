@@ -25,6 +25,12 @@
 #include "twinsock.h"
 #include "tx.h"
 
+#ifdef __MSDOS__
+#define	PORTSWAP(x)	ntohs(x)
+#else
+#define	PORTSWAP(x)	ntohl(x)
+#endif
+
 static	int	iErrno = 0;
 static	short	idNext = 0;
 
@@ -59,19 +65,19 @@ CopyDataIn(	void		*pvSource,
 	switch(at)
 	{
 	case AT_Int16:
+	case AT_Int16Ptr:
 		*(short *) pvDest = ntohs(*(short *) pvSource);
 		break;
 
 	case AT_Int32:
-		*(short *) pvDest = ntohs(*(short *) pvSource);
+	case AT_Int32Ptr:
+		*(short *) pvDest = ntohl(*(short *) pvSource);
 		break;
 
 	case AT_Char:
 		*(char *) pvDest = *(char *) pvSource;
 		break;
 
-	case AT_Int16Ptr:
-	case AT_Int32Ptr:
 	case AT_GenPtr:
 	case AT_String:
 		memcpy(pvDest, pvSource, nLen);
@@ -87,20 +93,20 @@ CopyDataOut(	void		*pvDest,
 {
 	switch(at)
 	{
+	case AT_Int16Ptr:
 	case AT_Int16:
 		*(short *) pvDest = htons(*(short *) pvSource);
 		break;
 
 	case AT_Int32:
-		*(short *) pvDest = htons(*(short *) pvSource);
+	case AT_Int32Ptr:
+		*(short *) pvDest = htonl(*(short *) pvSource);
 		break;
 
 	case AT_Char:
 		*(char *) pvDest = *(char *) pvSource;
 		break;
 
-	case AT_Int16Ptr:
-	case AT_Int32Ptr:
 	case AT_GenPtr:
 	case AT_String:
 		memcpy(pvDest, pvSource, nLen);
@@ -226,10 +232,10 @@ RemoveSocket(struct per_socket *pps)
 }
 
 static	void
-DataReceived(SOCKET s, void *pvData, int nLen, enum function_type ft)
+DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 {
 	struct	data	*pdNew, **ppdList;
-	struct	per_socket *pps;
+	struct	per_socket *pps, *ppsNew;
 	struct	per_task *ppt;
 	int		ns;
 
@@ -261,6 +267,12 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum function_type ft)
 	pdNew->nUsed = 0;
 	*ppdList = pdNew;
 
+	/* Note that the calls to Notify below should *really*
+	 * only be made if the data gets put at the head of the
+	 * queue, but some telnet implementations miss notifications
+	 * and this screws us right up. By putting in additional
+	 * notifications we at least have a chance of recovery.
+	 */
 	if (pps->iFlags & PSF_ACCEPT)
 	{
 		pdNew->iLen = 0;
@@ -269,18 +281,17 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum function_type ft)
 		else
 			ns = ntohs(*(short*) pvData);
 		ppt = GetAnotherTaskInfo(pps->htaskOwner);
-		pdNew->pchData = (char *) NewSocket(ppt, ns);
-		if (pdNew == pps->pdIn)
-			Notify(pps, FD_ACCEPT);
+		ppsNew = NewSocket(ppt, ns);
+		pdNew->pchData = (char *) ppsNew;
+		ppsNew->iFlags |= PSF_CONNECT;
+		Notify(pps, FD_ACCEPT);
 	}
 	else
 	{
 		pdNew->iLen = nLen;
 		pdNew->pchData = (char *) malloc(nLen);
 		memcpy(pdNew->pchData, pvData, nLen);
-
-		if (pdNew == pps->pdIn)
-			Notify(pps, nLen ? FD_READ : FD_CLOSE);
+		Notify(pps, nLen ? FD_READ : FD_CLOSE);
 	}
 }
 
@@ -598,7 +609,7 @@ CopyHostEntTo(struct per_task *ppt, char *pchData)
 	CopyHostEnt(ppt);
 
 	phe = (struct hostent *) pchData;
-	memcpy(phe, &ppt->he, sizeof(*phe));
+	memcpy(phe, &ppt->he, sizeof(ppt->he));
 
 	pchData += sizeof(*phe);
 
@@ -664,8 +675,8 @@ CopyServEntTo(struct per_task *ppt, char *pchData)
 	CopyServEnt(ppt);
 
 	pse = (struct servent *) pchData;
-	memcpy(pse, &ppt->se, sizeof(*pse));
-	pchData += sizeof(struct servent *);
+	memcpy(pse, &ppt->se, sizeof(ppt->se));
+	pchData += sizeof(*pse);
 
 	for (nAlii = 0; pse->s_aliases[nAlii]; nAlii++);
 	memcpy(pchData, pse->s_aliases, sizeof(char *) * (nAlii + 1));
@@ -720,7 +731,7 @@ CopyProtoEntTo(struct per_task *ppt, char *pchData)
 	CopyProtoEnt(ppt);
 
 	ppe = (struct protoent *) pchData;
-	memcpy(ppe, &ppt->se, sizeof(*ppe));
+	memcpy(ppe, &ppt->pe, sizeof(ppt->pe));
 	pchData += sizeof(*ppe);
 
 	for (nAlii = 0; ppe->p_aliases[nAlii]; nAlii++);
@@ -1325,6 +1336,19 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 	}
 }
 
+/* We don't wait for the result of a send because some telnets don't behave
+ * correctly with WSAEINPROGRESS when sending. This results in characters
+ * being dropped to hell while we wait for the response from the host.
+ * We return success unless the socket is not connected or is closed.
+ * This is fairly safe on connected sockets (which is what uses send).
+ *
+ * We don't do this with sendto because it's really only telnets that suffer
+ * from this, although that doesn't stop another application from having the
+ * same problem with sendto later on.
+ *
+ * This causes certain FTP clients to display phenomenal transfer rates.
+ * They should be checking the transfer rates *after* closing their sockets.
+ */
 int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 {
 	struct per_task *ppt;
@@ -1338,15 +1362,25 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
+	if (!(pps->iFlags & PSF_CONNECT))
+	{
+		iErrno = WSAENOTCONN;
+		return -1;
+	}
+	if (pps->iFlags & PSF_CLOSED)
+	{
+		iErrno = WSAECONNRESET;
+		return -1;
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_CARGS(pfaArgs[1],	AT_GenPtr,	buf,		len			);
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&len,		sizeof(len)		);
 	INIT_ARGS(pfaArgs[3],	AT_Int,		&flags,		sizeof(flags)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Send, 4, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
+	RemoveTXQ(TransmitFunction(&tf));
 	Notify(pps, FD_WRITE);
-	return nReturn;
+	return len;
 }
 
 int pascal far _export sendto (SOCKET s, const char FAR * buf, int len, int flags,
@@ -1521,6 +1555,9 @@ struct servent FAR * pascal far _export getservbyport(int port, const char FAR *
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	PORTSWAP(port);
+	if (!proto)
+		proto = "";
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&port,		sizeof(port)		);
 	INIT_CARGS(pfaArgs[1],	AT_String,	proto,		strlen(proto) + 1	);
 	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achServEnt,MAX_HOST_ENT		);
@@ -1546,6 +1583,8 @@ struct servent FAR * pascal far _export getservbyname(const char FAR * name,
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	if (!proto)
+		proto = "";
 	INIT_CARGS(pfaArgs[0],	AT_String,	name,		strlen(name) + 1	);
 	INIT_CARGS(pfaArgs[1],	AT_String,	proto,		strlen(proto) + 1	);
 	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achServEnt,MAX_HOST_ENT		);
@@ -1633,10 +1672,10 @@ int pascal far _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
 	lpWSAData->wVersion = 0x0101;
 	lpWSAData->wHighVersion = 0x0101;
 	strcpy(lpWSAData->szDescription,
-		"TwinSock 1.0 - Proxy sockets system. "
+		"TwinSock 1.1 - Proxy sockets system. "
 		"Copyright 1994 Troy Rollo. "
-		"This library is free software. "
-		"See the file \"COPYING.LIB\" from the "
+		"TwinSock is free software. "
+		"See the file \"COPYING\" from the "
 		"distribution for details.");
 	if (!hwndManager)
 		strcpy(lpWSAData->szSystemStatus, "Not Initialised.");
@@ -1803,9 +1842,11 @@ HANDLE pascal far _export WSAAsyncGetServByName(HWND hWnd, u_int wMsg,
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	if (!proto)
+		proto = "";
 	INIT_CARGS(pfaArgs[0],	AT_String,	name,		strlen(name) + 1	);
 	INIT_CARGS(pfaArgs[1],	AT_String,	proto,		strlen(proto) + 1	);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
+	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achServEnt,MAX_HOST_ENT		);
 	INIT_TF(tf, FN_ServByName, 2, pfaArgs, pfaReturn);
 	txq = TransmitFunction(&tf);
 	txq->hwnd = hWnd;
@@ -1828,9 +1869,12 @@ HANDLE pascal far _export WSAAsyncGetServByPort(HWND hWnd, u_int wMsg, int port,
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	port = PORTSWAP(port);
+	if (!proto)
+		proto = "";
 	INIT_CARGS(pfaArgs[0],	AT_Int,		&port,		sizeof(port)		);
 	INIT_CARGS(pfaArgs[1],	AT_String,	proto,		strlen(proto) + 1	);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
+	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achServEnt,MAX_HOST_ENT		);
 	INIT_TF(tf, FN_ServByPort, 2, pfaArgs, pfaReturn);
 	txq = TransmitFunction(&tf);
 	txq->hwnd = hWnd;
@@ -1854,7 +1898,7 @@ HANDLE pascal far _export WSAAsyncGetProtoByName(HWND hWnd, u_int wMsg,
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
 	INIT_CARGS(pfaArgs[0],	AT_String,	name,		strlen(name) + 1	);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
+	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achProtoEnt,MAX_HOST_ENT		);
 	INIT_TF(tf, FN_ProtoByName, 1, pfaArgs, pfaReturn);
 	txq = TransmitFunction(&tf);
 	txq->hwnd = hWnd;
@@ -1878,7 +1922,7 @@ HANDLE pascal far _export WSAAsyncGetProtoByNumber(HWND hWnd, u_int wMsg,
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
 	INIT_CARGS(pfaArgs[0],	AT_Int,		&number,	sizeof(number)		);
-	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
+	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achProtoEnt,MAX_HOST_ENT		);
 	INIT_TF(tf, FN_ProtoByNumber, 1, pfaArgs, pfaReturn);
 	txq = TransmitFunction(&tf);
 	txq->hwnd = hWnd;
@@ -1974,6 +2018,12 @@ int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
 	pps->wMsg = wMsg;
 	pps->iEvents = lEvent;
 	Notify(pps, FD_WRITE);
+	if (pps->pdIn)
+		Notify(pps, (pps->iFlags & PSF_ACCEPT) ?
+				FD_ACCEPT :
+				(pps->pdIn->iLen ?
+					FD_READ :
+					FD_CLOSE));
 	return 0;
 }
 

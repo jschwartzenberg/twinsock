@@ -12,7 +12,13 @@ packet.obj: packet.c
 twinsock.obj: twinsock.c
 	bcc -WE -ml -v -w- -c twinsock.c
 
-twinsock.exe: twinsock.obj packet.obj winsock.lib
-	bcc -WE -lc -lC -ml -v twinsock.obj packet.obj winsock.lib
+about.obj: about.c
+	bcc -WE -ml -v -w- -c about.c
+
+comms.obj: comms.c
+	bcc -WE -ml -v -w- -c comms.c
+
+twinsock.exe: twinsock.obj packet.obj about.obj comms.obj winsock.lib
+	bcc -WE -lc -lC -ml -v twinsock.obj packet.obj about.obj comms.obj winsock.lib
 	rc twinsock
 

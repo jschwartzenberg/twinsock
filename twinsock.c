@@ -23,23 +23,42 @@
 #include "twinsock.h"
 #include "tx.h"
 
+HINSTANCE	hinst;
+
 extern	RegisterManager(HWND hwnd);
+static void SendInitRequest(void);
+void	Shutdown(void);
+void	OpenPort(void);
+extern	int	iPortChanged;
 
 #define	READ_MAX	1024
 #define	TIMER_ID_SEND		1
 #define	TIMER_ID_RECEIVE	2
 #define	TIMER_ID_FLUSH		3
+#define	TIMER_ID_BREAK		4
 
 static	int	idComm;
 static	HWND	hwnd;
 static	BOOL	bFlushing = FALSE;
+static	BOOL	bTerminal = TRUE;
+
+#define	SCREEN_COLUMNS	80
+#define	SCREEN_ROWS	25
+static	char	aachScreen[SCREEN_ROWS][SCREEN_COLUMNS];
+static	int	iScrollRow = 0;
+static	int	iRow = 0, iColumn = 0;
+static	int	cyRow, cxColumn;
+#define	ROW_INDEX(x)	((x + iScrollRow) % SCREEN_ROWS)
+
+static	char	const	achProtoInit[] = "@$TSStart$@";
+static	int	iInitChar = 0;
 
 extern	void PacketReceiveData(void *pvData, int iLen);
 
 void	SetTransmitTimeout(void)
 {
 	KillTimer(hwnd, TIMER_ID_SEND);
-	SetTimer(hwnd, TIMER_ID_SEND, 3000, 0);
+	SetTimer(hwnd, TIMER_ID_SEND, 10000, 0);
 }
 
 void	KillTransmitTimeout(void)
@@ -65,11 +84,72 @@ void	FlushInput(void)
 	SetTimer(hwnd, TIMER_ID_FLUSH, 1500, 0);
 }
 
+static	void
+AddChar(char c)
+{
+	RECT	rcClient;
+	RECT	rcRedraw;
+
+	if (c == '\r')
+	{
+		iColumn = 0;
+	}
+	else if (c == '\b')
+	{
+		if (iColumn > 0)
+			iColumn--;
+	}
+	else if (c == '\n')
+	{
+		if (iRow < SCREEN_ROWS - 1)
+		{
+			iRow++;
+		}
+		else
+		{
+			memset(aachScreen[iScrollRow], 0x20, sizeof(aachScreen[iScrollRow]));
+			iScrollRow++;
+			while (iScrollRow >= SCREEN_ROWS)
+				iScrollRow -= SCREEN_ROWS;
+			GetClientRect(hwnd, &rcClient);
+			ScrollWindow(hwnd, 0, -cyRow, &rcClient, 0);
+			UpdateWindow(hwnd);
+		}
+	}
+	else if (c >= 0x20 && c <= 0x7e)
+	{
+		aachScreen[ROW_INDEX(iRow)][iColumn] = c;
+		rcRedraw.top = iRow * cyRow;
+		rcRedraw.left = iColumn * cxColumn;
+		rcRedraw.bottom = rcRedraw.top + cyRow;
+		rcRedraw.right = rcRedraw.left + cxColumn;
+		InvalidateRect(hwnd, &rcRedraw, TRUE);
+		if (iColumn < SCREEN_COLUMNS - 1)
+			iColumn++;
+	}
+	if (c == achProtoInit[iInitChar])
+	{
+		iInitChar++;
+		if (iInitChar == strlen(achProtoInit))
+		{
+			iInitChar = 0;
+			bTerminal = 0;
+			RegisterManager(hwnd);
+			SendInitRequest();
+		}
+	}
+	else
+	{
+		iInitChar = 0;
+	}
+}
+
 static	void	DoReading(void)
 {
 	static	char	achBuffer[READ_MAX];
 	int	nRead;
 	COMSTAT	cs;
+	int	i;
 
 	do
 	{
@@ -81,10 +161,22 @@ static	void	DoReading(void)
 		}
 		if (nRead)
 		{
-			if (bFlushing)
+			if (bTerminal)
+			{
+				HideCaret(hwnd);
+				for (i = 0; i < nRead; i++)
+					AddChar(achBuffer[i]);
+				SetCaretPos(iColumn * cxColumn, iRow * cyRow);
+				ShowCaret(hwnd);
+			}
+			else if (bFlushing)
+			{
 				FlushInput();
+			}
 			else
+			{
 				PacketReceiveData(achBuffer, nRead);
+			}
 		}
 	} while (nRead);
 }
@@ -112,19 +204,98 @@ int	SendData(void *pvData, int iDataLen)
 	return iDataLen;
 }
 
+void
+PaintScreen(	HWND	hWnd)
+{
+	int	i, iRow;
+	int	iCol;
+	TEXTMETRIC tm;
+	HFONT	hfontOld;
+	HFONT	hfontFixed;
+	PAINTSTRUCT ps;
+	int	cyHeight;
+	int	yPos;
+
+	BeginPaint(hWnd, &ps);
+	hfontFixed = (HFONT) GetStockObject(SYSTEM_FIXED_FONT);
+	hfontOld = (HFONT) SelectObject(ps.hdc, (HGDIOBJ) hfontFixed);
+	GetTextMetrics(ps.hdc, &tm);
+	cyHeight = tm.tmHeight + tm.tmExternalLeading;
+	for (i = 0; i < SCREEN_ROWS; i++)
+	{
+		iRow = ROW_INDEX(i);
+		TextOut(ps.hdc, 0, i * cyRow, aachScreen[iRow], SCREEN_COLUMNS);
+	}
+	SelectObject(ps.hdc, (HGDIOBJ) hfontOld);
+	EndPaint(hWnd, &ps);
+}
+
 LRESULT	CALLBACK _export
 WindowProc(	HWND	hWnd,
 		UINT	wMsg,
 		WPARAM	wParam,
 		LPARAM	lParam)
 {
+	char	c;
 
 	switch(wMsg)
 	{
-	case WM_SYSCOMMAND:
-		if (wParam == SC_MAXIMIZE ||
-		    wParam == SC_RESTORE)
-			return 0;
+	case WM_COMMAND:
+		switch(wParam)
+		{
+		case 100:
+			if (CommsEdit(hWnd))
+			{
+				if (iPortChanged)
+				{
+					CloseComm(idComm);
+					OpenPort();
+				}
+				else
+				{
+					InitComm(idComm);
+				}
+			}
+			break;
+
+		case 101:
+			if (bTerminal)
+			{
+				bTerminal = 0;
+				RegisterManager(hwnd);
+				SendInitRequest();
+			}
+			break;
+
+		case 102:
+			if (!bTerminal)
+			{
+				Shutdown();
+				SendData("\030\030\030\030\030", 5);
+			}
+			break;
+
+		case 103:
+			PostQuitMessage(0);
+			break;
+
+		case 104:
+			if (bTerminal)
+			{
+				SetCommBreak(idComm);
+				SetTimer(hwnd, TIMER_ID_BREAK, 1500, 0);
+			}
+			break;
+
+		case 105:
+			if (bTerminal)
+				DialNumber(hWnd);
+			break;
+
+		case 201:
+			About(hWnd);
+			break;
+		}
 		break;
 
 	case WM_COMMNOTIFY:
@@ -133,6 +304,14 @@ WindowProc(	HWND	hWnd,
 		case CN_RECEIVE:
 			DoReading();
 			break;
+		}
+		break;
+
+	case WM_CHAR:
+		if (bTerminal)
+		{
+			c = wParam;
+			SendData(&c, 1);
 		}
 		break;
 
@@ -152,7 +331,27 @@ WindowProc(	HWND	hWnd,
 			KillTimer(hWnd, TIMER_ID_FLUSH);
 			bFlushing = FALSE;
 			break;
+
+		case TIMER_ID_BREAK:
+			ClearCommBreak(idComm);
+			KillTimer(hWnd, TIMER_ID_BREAK);
+			break;
 		}
+		break;
+
+	case WM_PAINT:
+		PaintScreen(hWnd);
+		return 0;
+		break;
+
+	case WM_SETFOCUS:
+		CreateCaret(hWnd, 0, cxColumn, cyRow);
+		SetCaretPos(iColumn * cxColumn, iRow * cyRow);
+		ShowCaret(hWnd);
+		break;
+
+	case WM_KILLFOCUS:
+		DestroyCaret();
 		break;
 
 	case WM_USER:
@@ -212,21 +411,24 @@ DataReceived(void *pvData, int iLen)
 			if (nBytes == nPktLen)
 			{
 				if (ft == FN_Init)
-					SetInitialised();
+				{
+					if (ptxr->id == -1)
+					{
+						SetWindowText(hwnd, "TwinSock - Connected");
+						CloseWindow(hwnd);
+						SetInitialised();
+					}
+				}
 				else
+				{
 					ResponseReceived(ptxr);
+				}
 				free(ptxr);
 				ptxr = 0;
 				nBytes = 0;
 			}
 		}
 	}
-}
-
-static	UINT
-GetConfigInt(char const *pchItem, UINT nDefault)
-{
-	return GetPrivateProfileInt("Config", pchItem, nDefault, "TWINSOCK.INI");
 }
 
 static void
@@ -245,7 +447,79 @@ SendInitRequest(void)
 void
 Shutdown(void)
 {
-	PostQuitMessage(0);
+	bTerminal = 1;
+	SetWindowText(hwnd, "TwinSock - No Connection");
+	KillTimer(hwnd, TIMER_ID_SEND);
+	KillTimer(hwnd, TIMER_ID_RECEIVE);
+	KillTimer(hwnd, TIMER_ID_FLUSH);
+	ReInitPackets();
+}
+
+void
+OpenPort(void)
+{
+	char	achProfileEntry[256];
+	char	achMsgBuf[512];
+	char	*pchError;
+
+	do
+	{
+		iPortChanged = 0;
+		GetPrivateProfileString("Config", "Port", "COM1", achProfileEntry, 256, "TWINSOCK.INI");
+		idComm = OpenComm(achProfileEntry, 16384, 16384);
+		if (idComm < 0)
+		{
+		switch(idComm)
+		{
+			case IE_BADID:
+				pchError = "No such device";
+				break;
+
+			case IE_BAUDRATE:
+				pchError = "Speed not supported";
+				break;
+
+			case IE_BYTESIZE:
+				pchError = "Byte size not supported";
+				break;
+
+			case IE_DEFAULT:
+				pchError = "Bad default parameters for port";
+				break;
+
+			case IE_HARDWARE:
+				pchError = "Port in use";
+				break;
+
+			case IE_MEMORY:
+				pchError = "Out of memory";
+				break;
+
+			case IE_NOPEN:
+				pchError = "Device not open";
+				break;
+
+			case IE_OPEN:
+				pchError = "Device is already open";
+				break;
+
+			default:
+				pchError = "Error Unknown";
+				break;
+			}
+			sprintf(achMsgBuf,
+				"Unable to open port \"%s\": %s",
+				achProfileEntry,
+				pchError);		
+			if (MessageBox(0, achMsgBuf, "TwinSock", MB_OKCANCEL) == IDCANCEL)
+				exit(1);
+			if (!CommsEdit(hwnd))
+				exit(1);
+		}
+	} while (idComm < 0);
+
+	InitComm(idComm);
+	EnableCommNotification(idComm, hwnd, 1, 0);
 }
 
 #pragma argsused
@@ -257,9 +531,25 @@ WinMain(HINSTANCE	hInstance,
 {
 	WNDCLASS wc;
 	MSG	msg;
-	DCB	dcb;
-	char	achProfileEntry[256];
+	char	*pchError;
+	TEXTMETRIC	tm;
+	HDC	hdc;
+	HWND	hwndDesktop;
+	HFONT	hfontOld;
+	HFONT	hfontFixed;
 
+	hinst = hInstance;
+	hwndDesktop = GetDesktopWindow();
+	hdc = GetDC(hwndDesktop);
+	hfontFixed = (HFONT) GetStockObject(SYSTEM_FIXED_FONT);
+	hfontOld = (HFONT) SelectObject(hdc, (HGDIOBJ) hfontFixed);
+	GetTextMetrics(hdc, &tm);
+	SelectObject(hdc, (HGDIOBJ) hfontOld);
+	ReleaseDC(hwnd, hdc);
+	cxColumn = tm.tmAveCharWidth;
+	cyRow = tm.tmHeight + tm.tmExternalLeading;
+
+	memset(aachScreen, 0x20, sizeof(aachScreen));
 	wc.style = 0;
 	wc.lpfnWndProc = WindowProc;
 	wc.cbClsExtra = 0;
@@ -267,65 +557,29 @@ WinMain(HINSTANCE	hInstance,
 	wc.hInstance = hInstance;
 	wc.hIcon = LoadIcon(hInstance, "TSICON");
 	wc.hCursor = 0;
-	wc.hbrBackground = 0;
-	wc.lpszMenuName = 0;
+	wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH);
+	wc.lpszMenuName = "TS_MENU";
 	wc.lpszClassName = "TwinSock Communications";
 	RegisterClass(&wc);
 	hwnd = CreateWindow(	"TwinSock Communications",
-				"TwinSock Communications",
-				WS_OVERLAPPEDWINDOW |
-				 WS_MINIMIZE |
+				"TwinSock - No Connection",
+				WS_OVERLAPPED |
+				 WS_CAPTION |
+				 WS_SYSMENU |
+				 WS_MINIMIZEBOX |
 				 WS_VISIBLE,
 				CW_USEDEFAULT,
-				0,
 				CW_USEDEFAULT,
-				0,
+				cxColumn * SCREEN_COLUMNS + 2,
+				cyRow * SCREEN_ROWS + 4 +
+				  GetSystemMetrics(SM_CYCAPTION) +
+				  GetSystemMetrics(SM_CYMENU),
 				0,
 				0,
 				hInstance,
 				0);
-	ShowWindow(hwnd, SW_SHOW);
-	RegisterManager(hwnd);
 
-	GetPrivateProfileString("Config", "Port", "COM1", achProfileEntry, 256, "TWINSOCK.INI");
-	idComm = OpenComm(achProfileEntry, 1024, 1024);
-	if (idComm < 0)
-		exit(1);
-	dcb.Id = idComm;
-	dcb.BaudRate = GetConfigInt("Speed", 19200);
-	dcb.ByteSize = GetConfigInt("Databits", 8);
-	dcb.Parity = GetConfigInt("Parity", NOPARITY);
-	dcb.StopBits = GetConfigInt("StopBits", ONESTOPBIT);
-	dcb.RlsTimeout = GetConfigInt("RlsTimeout", 0);
-	dcb.CtsTimeout = GetConfigInt("CtsTimeout", 0);
-	dcb.DsrTimeout = GetConfigInt("DsrTimeout", 0);
-	dcb.fBinary = TRUE;
-	dcb.fRtsDisable = GetConfigInt("fRtsDisable", TRUE);
-	dcb.fParity = GetConfigInt("fParity", FALSE);
-	dcb.fOutxCtsFlow = GetConfigInt("OutxCtsFlow", FALSE);
-	dcb.fOutxDsrFlow = GetConfigInt("OutxDsrFlow", FALSE);
-	dcb.fDummy = 0;
-	dcb.fDtrDisable = GetConfigInt("fDtrDisable", TRUE);
-	dcb.fOutX = GetConfigInt("fOutX", TRUE);
-	dcb.fInX = GetConfigInt("fInX", FALSE);
-	dcb.fPeChar = 0;
-	dcb.fNull = 0;
-	dcb.fChEvt = 0;
-	dcb.fDtrflow = GetConfigInt("fDtrFlow", FALSE);
-	dcb.fRtsflow = GetConfigInt("fRtsFlow", FALSE);
-	dcb.fDummy2 = 0;
-	dcb.XonChar = '\021';
-	dcb.XoffChar = '\023';
-	dcb.XonLim = 100;
-	dcb.XoffLim = 900;
-	dcb.PeChar = 0;
-	dcb.EofChar = 0;
-	dcb.EvtChar = 0;
-	dcb.TxDelay = 0;
-
-	SetCommState(&dcb);
-	EnableCommNotification(idComm, hwnd, 1, 0);
-	SendInitRequest();
+	OpenPort();
 
  	while (GetMessage(&msg, 0, 0, 0))
 	{

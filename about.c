@@ -17,28 +17,39 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
+#include <windows.h>
 
-struct	tx_request
-{
-	short	iType;
-	short	nArgs;
-	short	nLen;
-	short	id;
-	short	nError;
-	char	pchData[1];
-};
+extern	HINSTANCE hinst;
 
-#ifdef _Windows
-struct	tx_queue
+BOOL	CALLBACK
+AboutDlgProc(	HWND	hDlg,
+		UINT	wMsg,
+		WPARAM	wParam,
+		LPARAM	lParam)
 {
-	struct	tx_request *ptxr;
-	short	id;
-	struct tx_queue *ptxqNext;
-	BOOL	bDone;
-	char	*pchLocation;
-	HWND	hwnd;
-	u_int	wMsg;
-	enum Functions ft;
-	HTASK	htask;
-};
-#endif
+	if (wMsg == WM_COMMAND &&
+	    (wParam == IDOK || wParam == IDCANCEL))
+	{
+		EndDialog(hDlg, TRUE);
+		return TRUE;
+	}
+	else if (wMsg == WM_INITDIALOG)
+	{
+		return TRUE;
+	}
+	else
+	{
+		return FALSE;
+	}
+}
+
+void
+About(HWND hwndParent)
+{
+	FARPROC	fpDlgProc;
+
+	fpDlgProc = MakeProcInstance((FARPROC) AboutDlgProc, hinst);
+	DialogBox(hinst, "ABOUT_DLG", hwndParent, fpDlgProc);
+	FreeProcInstance(fpDlgProc);
+}
+

@@ -159,4 +159,3 @@ struct	per_socket
 		  tf.pfaResult = &retval )
 
 #endif
-

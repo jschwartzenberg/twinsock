@@ -23,8 +23,13 @@
 #include <stdio.h>
 #include <netinet/in.h>
 #include <errno.h>
+#ifdef NEED_SELECT_H
+#include <sys/select.h>
+#endif
 #include "twinsock.h"
 #include "tx.h"
+
+extern	void	PacketTransmitData(void *pvData, int iDataLen, int iStream);
 
 #define	BUFFER_SIZE	1024
 
@@ -73,13 +78,15 @@ main(int argc, char **argv)
 	struct	timeval tvZero;
 	struct	timeval tv;
 
-	fprintf(stderr, "TwinSock Host 1.0\n");
+	fprintf(stderr, "TwinSock Host 1.1 (pre release)\n");
 	fprintf(stderr, "Copyright 1994 Troy Rollo\n");
 	fprintf(stderr, "This program is free software\n");
 	fprintf(stderr, "See the file COPYING for details\n");
 	fprintf(stderr, "\nStart your TwinSock client now\n");
+	fprintf(stderr, "!@$TSStart$@\n");
 
-	InitTerm();
+	if (isatty(0))
+		InitTerm();
 	nLargestFD = 0;
 	FD_ZERO(&fdsActive);
 	FD_ZERO(&fdsWrite);
@@ -107,6 +114,10 @@ main(int argc, char **argv)
 					FlushInput();
 				else
 					PacketReceiveData(achBuffer, nRead);
+			}
+			else if (nRead == 0 && !isatty(0))
+			{
+				exit(0);
 			}
 		}
 		for (i = 3; i <= nLargestFD; i++)
@@ -148,6 +159,13 @@ main(int argc, char **argv)
 							0,
 							&saSource,
 							&nSourceLen);
+					if (nRead < 0 &&
+					    errno == ENOTCONN)
+					{
+						/* Was a datagram socket */
+						SetClosed(i);
+						continue;
+					}
 					if (nRead >= 0)
 						SendSocketData(i,
 							achBuffer,
@@ -305,7 +323,8 @@ int	KillTimer(int idTimer)
 
 void	Shutdown(void)
 {
-	UnInitTerm();
+	if (isatty(0))
+		UnInitTerm();
 	fprintf(stderr, "\nTwinSock Host Finished\n");
 	exit(0);
 }
@@ -404,4 +423,3 @@ DataReceived(void *pvData, int iLen)
 		}
 	}
 }
-
