@@ -153,6 +153,14 @@ static int HostSocketProtocol[] =
 	70, 71, 72, 73, 74, 75, 76, IPPROTO_ND, 78, 79
 };
 
+
+#ifndef SO_ACCEPTCONN
+#define	SO_ACCEPTCONN 0
+#endif
+#ifndef SO_USELOOPBACK
+#define	SO_USELOOPBACK 0
+#endif
+
 static struct
 {
  int iWindows;
@@ -339,8 +347,12 @@ SetIntVal(struct func_arg *pfa, long iVal)
 struct sockaddr *
 ConvertSA(struct func_arg *pfa, struct sockaddr_in *sin)
 {
+	u_short tmp;
+
 	memcpy(sin, pfa->pvData, sizeof(*sin));
-	sin->sin_family = GetFamily(ntohs(sin->sin_family));
+	tmp = *(u_short *) sin;
+	*(u_short *) sin = 0;
+	sin->sin_family = GetFamily(ntohs(tmp));
 	return (struct sockaddr *) sin;
 }
 
@@ -524,6 +536,102 @@ SwapSockOptOut(	struct func_arg *pfa,
 	}
 }
 
+
+int
+CompressArg(	struct	tx_request *ptxr,
+		struct	func_arg *pfaArgs,
+		int	nArgs,
+		struct	func_arg *pfaResult,
+		int	iArg)
+{
+	struct	func_arg *pfaNow;
+	char	*pchNewData, *pchData;
+	int	i, j;
+	int	nLen;
+
+	pchData = pchNewData = ptxr->pchData;
+	for (i = 0; i <= nArgs; i++)
+	{
+		if (i < nArgs)
+			pfaNow = pfaArgs + i;
+		else
+			pfaNow = pfaResult;
+		for (j = 0; j < pfaNow->iLen + 4; j++)
+			pchNewData[j] = pchData[j];
+		pchData += pfaNow->iLen + 4;
+		if (i == iArg)
+		{
+			pfaNow->iLen = 0;
+			*(short *) (pchNewData + 2) = 0;
+		}
+		pchNewData += pfaNow->iLen + 4;
+	}
+	nLen = pchNewData - ptxr->pchData + 10;
+	ptxr->nLen = htons((short) nLen);
+	return nLen;
+}
+
+
+void
+GetPortRange(	short	iInPort,
+		short	*piStartPort,
+		short	*piEndPort)
+{
+	char	achBuffer[1024];
+	char	achPort[20];
+	char	*pchComma;
+
+	sprintf(achPort, "%d", (int) iInPort);
+	GetTwinSockSetting("Mappings",
+			achPort,
+			"",
+			achBuffer,
+			sizeof(achBuffer));
+	if (!*achBuffer || !(pchComma = (char *) strchr(achBuffer, ',')))
+	{
+		*piStartPort = *piEndPort = iInPort;
+		return;
+	}
+	*pchComma++ = 0;
+	*piStartPort = atoi(achBuffer);
+	*piEndPort = atoi(pchComma);
+}
+
+void
+SendRemapMessage(	short	iFrom,
+			short	iTo)
+{
+	char	achBuffer[1024];
+	char	achPortDesc[50];
+	char	achPort[20];
+	struct	tx_request *ptxr;
+
+	sprintf(achPortDesc, "Port %d", (int) iFrom);
+	sprintf(achPort, "%d", (int) iFrom);
+	GetTwinSockSetting("PortNames",
+			achPort,
+			achPortDesc,
+			achBuffer,
+			sizeof(achBuffer));
+	strcat(achBuffer, " remapped to ");
+	sprintf(achPortDesc, "Port %d", (int) iTo);
+	sprintf(achPort, "%d", (int) iTo);
+	GetTwinSockSetting("PortNames",
+			achPort,
+			achPortDesc,
+			achBuffer + strlen(achBuffer),
+			sizeof(achBuffer) - strlen(achBuffer));
+	ptxr = (struct tx_request *) malloc(11 + strlen(achBuffer));
+        ptxr->iType = htons(FN_Message);
+        ptxr->nArgs = 0;
+        ptxr->nLen = htons(11 + strlen(achBuffer));
+        ptxr->id = -1;
+        ptxr->nError = 0;
+	strcpy(ptxr->pchData, achBuffer);
+        PacketTransmitData(ptxr, 10 + strlen(achBuffer) + 1, -2);
+	free(ptxr);
+}
+
 void
 ResponseReceived(struct tx_request *ptxr_)
 {
@@ -531,6 +639,10 @@ ResponseReceived(struct tx_request *ptxr_)
 	short	nArgs;
 	short	nLen;
 	short	id;
+	short	iInPort;
+	short	iStartPort;
+	short	iEndPort;
+	short	iPort;
 	int	iLen;
 	int	iValue;
 	int	iSocket;
@@ -595,6 +707,7 @@ ResponseReceived(struct tx_request *ptxr_)
 			     pfaArgs[1].pvData,
 			     GetIntVal(&pfaArgs[2]),
 			     GetIntVal(&pfaArgs[3])));
+		nLen = CompressArg(ptxr, pfaArgs, nArgs, &faResult, 1);
 		break;
 
 	case FN_SendTo:
@@ -605,13 +718,28 @@ ResponseReceived(struct tx_request *ptxr_)
 			       GetIntVal(&pfaArgs[3]),
 			       ConvertSA(&pfaArgs[4], &sin),
 			       GetIntVal(&pfaArgs[5])));
+		nLen = CompressArg(ptxr, pfaArgs, nArgs, &faResult, 1);
 		break;
 
 	case FN_Bind:
-		SetIntVal(&faResult,
-			bind(GetIntVal(&pfaArgs[0]),
-			     ConvertSA(&pfaArgs[1], &sin),
-			     GetIntVal(&pfaArgs[2])));
+		ConvertSA(&pfaArgs[1], &sin);
+		iInPort = ntohs(sin.sin_port);
+		GetPortRange(iInPort, &iStartPort, &iEndPort);
+		for (iPort = iStartPort; iPort <= iEndPort; iPort++)
+		{
+			errno = 0;
+			sin.sin_port = htons(iPort);
+			iValue = bind(GetIntVal(&pfaArgs[0]),
+					(struct sockaddr *) &sin,
+			     		GetIntVal(&pfaArgs[2]));
+			if (!iValue)
+			{
+				if (iPort != iInPort)
+					SendRemapMessage(iInPort, iPort);
+				break;
+			}
+		}
+		SetIntVal(&faResult, iValue);
 		break;
 
 	case FN_Connect:
@@ -865,4 +993,3 @@ SendSocketData(int iSocket,
 		(ft == FN_Data) ? iSocket : -2);
 	free(ptxr);
 }
-

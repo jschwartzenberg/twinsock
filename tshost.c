@@ -91,23 +91,38 @@ main(int argc, char **argv)
 					eLine = E_8NoCtrl;
 					break;
 
+				case 'N':
+					eLine = E_8NoHiCtrl;
+					break;
+
 				case 'x':
 					eLine = E_8NoX;
+					break;
+
+				case 'X':
+					eLine = E_8NoHiX;
+					break;
+
+				case 'e':
+					eLine = E_Explicit;
 					break;
 				}
 			}
 		}
 	}
 
-	fprintf(stderr, "TwinSock Host 1.3\n");
-	fprintf(stderr, "Copyright 1994 Troy Rollo\n");
+	fprintf(stderr, "TwinSock Host 1.4\n");
+	fprintf(stderr, "Copyright 1994-1995 Troy Rollo\n");
 	fprintf(stderr, "This program is free software\n");
 	fprintf(stderr, "See the file COPYING for details\n");
 	fprintf(stderr, "\nStart your TwinSock client now\n");
-	fprintf(stderr, "!@$TSStart%d$@\n", (int) eLine);
 
 	if (isatty(0))
 		InitTerm();
+
+	InitProtocol();
+	fprintf(stdout, "!@$TSStart%d$@", (int) eLine);
+	fflush(stdout);
 
 	nLargestFD = 0;
 	FD_ZERO(&fdsActive);
@@ -365,7 +380,10 @@ SendData(void *pvData, int iDataLen)
 	{
 		nWritten = write(1, pvData, iDataLen);
 		if (nWritten > 0)
+		{
+			pvData = (char *) pvData + nWritten;
 			iLen -= nWritten;
+		}
 	}
 	return iDataLen;
 }

@@ -47,7 +47,7 @@ FONT 8, "MS Sans Serif"
 {
  DEFPUSHBUTTON "OK", IDOK, 72, 109, 50, 14
  ICON "TSICON", -1, 9, 12, 18, 20
- CTEXT "TwinSock 1.3", -1, 33, 7, 127, 8
+ CTEXT "TwinSock 1.4", -1, 33, 7, 127, 8
  CTEXT "Copyright 1994-1995 Troy Rollo", -1, 33, 20, 127, 8
  CTEXT "This Program Is Free Software", -1, 33, 33, 127, 8
  LTEXT "You may redistribute it under the terms of the file LICENSE.TXT, included with the TwinSock software.", -1, 33, 44, 127, 43

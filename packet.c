@@ -16,6 +16,7 @@
 #ifdef __MSDOS__
 #include <winsock.h>
 #include <stdlib.h>
+#include <string.h>
 #else
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -38,6 +39,13 @@ long	nIncomplete = 0;
 enum Encoding eLine = E_6Bit;
 
 extern	int	SendData(void	*pvData, int nBytes);
+
+static	char	achEscaped[256];
+static	int	nEscaped = 0;
+static	char	achIgnored[256];
+static	int	nIgnored = 0;
+static	char	achBuffer[1024];
+static	int	nOffset = 0;
 
 static unsigned long crc_32_tab[] = { /* CRC polynomial 0xedb88320 */
 0x00000000l, 0x77073096l, 0xee0e612cl, 0x990951bal, 0x076dc419l, 0x706af48fl, 0xe963a535l, 0x9e6495a3l,
@@ -88,7 +96,7 @@ int size;
 		crc = UPDC32(*data++, crc);
 	}
 	crc = ~crc;
-	return (crc & 0xffff);
+	return ((short)crc & 0xffff);
 }
 
 struct	packet_queue
@@ -148,12 +156,13 @@ int	TransmitData(void *pvData, int iDataLen)
 	char	*pchDataIn;
 	char	*pchDataOut;
 	char	c;
-	int	iIn, iOut;
+	int	iIn, iOut, iCheck;
 	int	nBits;
 	int	nBitsLeft;
 	int	nBitsNow;
 	int	nDataOut;
 	char	cNow, cTmp;
+	int	nBitsCode;
 
 	pchDataIn = (char *) pvData;
 	pchDataOut = (char *) malloc(iDataLen * 2 + 1); /* Worst case */
@@ -161,9 +170,19 @@ int	TransmitData(void *pvData, int iDataLen)
 	cNow = 0;
 	switch(eLine)
 	{
+	case E_8NoHiCtrl:
 	case E_6Bit:
-		nDataOut = iDataLen * 4 / 3 + 1;
-		if (iDataLen % 6)
+		if (eLine == E_6Bit)
+		{
+			nBitsCode = 6;
+			nDataOut = iDataLen * 4 / 3 + 1;
+		}
+		else
+		{
+			nBitsCode = 7;
+			nDataOut = (int) ((long) iDataLen * 8 / 7 + 1);
+		}
+		if (iDataLen % nBitsCode)
 			nDataOut++;
 		pchDataOut[0] = '@';	/* Signals the receiving end to realign to bit 0 */
 		for (iIn = 0, iOut = 1; iOut < nDataOut;)
@@ -171,7 +190,7 @@ int	TransmitData(void *pvData, int iDataLen)
 			if (nBitsLeft)
 			{
 				cTmp = c & ((1 << nBitsLeft) - 1);
-				nBitsNow = 6 - nBits;
+				nBitsNow = nBitsCode - nBits;
 				if (nBitsLeft < nBitsNow)
 					nBitsNow = nBitsLeft;
 				cNow <<= nBitsNow;
@@ -180,9 +199,17 @@ int	TransmitData(void *pvData, int iDataLen)
 				cNow |= cTmp;
 				nBits += nBitsNow;
 				nBitsLeft -= nBitsNow;
-				if (nBits == 6)
+				if (nBits == nBitsCode)
 				{
-					pchDataOut[iOut++] = ach6bit[cNow];
+					if (cNow >= 64)
+					{
+						pchDataOut[iOut] = ach6bit[cNow - 64];
+						pchDataOut[iOut++] |= 0x80;
+					}
+					else
+					{
+						pchDataOut[iOut++] = ach6bit[cNow];
+					}
 					cNow = 0;
 					nBits = 0;
 				}
@@ -198,9 +225,44 @@ int	TransmitData(void *pvData, int iDataLen)
 		}
 		break;
 
+	case E_Explicit:
+		for (iIn = iOut = 0; iIn < iDataLen; iIn++)
+		{
+			c = pchDataIn[iIn];
+			if (c == '@')
+			{
+				strcpy(pchDataOut + iOut, "@ ");
+				iOut += 2;
+			}
+			else if (c == '\030')
+			{
+				pchDataOut[iOut++] = '@';
+				pchDataOut[iOut++] = c + nOffset;
+			}
+			else
+			{
+				for (iCheck = 0; iCheck < nEscaped; iCheck++)
+				{
+					if (achEscaped[iCheck] == c)
+					{
+						pchDataOut[iOut++] = '@';
+						pchDataOut[iOut++] = c + nOffset;
+						break;
+					}
+				}
+				if (iCheck == nEscaped)
+				{
+					pchDataOut[iOut++] = c;
+				}
+			}
+		}
+		nDataOut = iOut;
+		break;
+
 	case E_8Bit:
 	case E_8NoX:
 	case E_8NoCtrl:
+	case E_8NoHiX:
 		for (iIn = 0, iOut = 0; iIn < iDataLen; iIn++)
 		{
 			c = pchDataIn[iIn];
@@ -222,6 +284,16 @@ int	TransmitData(void *pvData, int iDataLen)
 			else if (eLine == E_8NoX && c == '\021')
 			{
 				strcpy(pchDataOut + iOut, "@Q");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoHiX && c == '\223')
+			{
+				strcpy(pchDataOut + iOut, "@\323");
+				iOut += 2;
+			}
+			else if (eLine == E_8NoHiX && c == '\221')
+			{
+				strcpy(pchDataOut + iOut, "@\321");
 				iOut += 2;
 			}
 			else if (eLine == E_8NoCtrl &&
@@ -425,11 +497,72 @@ void	PoppedPacket(struct packet_queue *ppqPopped)
 	}
 }
 
+static	int
+CopyCharacters(	char	*c,
+		char	*achDest)
+{
+	char	cCurrent;
+	int	iTotal = 0;
+
+		while (*c)
+	{
+		while (isspace(*c))
+			c++;
+		if (*c == '\\')
+		{
+			cCurrent = 	((int) (c[1] - '0')) * 64 +
+					((int) (c[2] - '0')) * 8 +
+					((int) (c[3] - '0'));
+			c += 4;
+			achDest[iTotal++] = cCurrent;
+		}
+		else if (*c == '^')
+		{
+			cCurrent = c[1] - 64;
+			c += 2;
+			if (*c == '!')
+			{
+				cCurrent |= 0x80;
+				c++;
+			}
+			achDest[iTotal++] = cCurrent;
+		}
+		while (!isspace(*c) && *c)
+			c++;
+	}
+	return iTotal;
+}
+
+void
+InitProtocol(void)
+{
+	if (eLine == E_Explicit)
+	{
+		GetTwinSockSetting(	"Protocol",
+					"Escaped",
+					"",
+					achBuffer,
+					sizeof(achBuffer));
+		nEscaped = CopyCharacters(achBuffer, achEscaped);
+		GetTwinSockSetting(	"Protocol",
+					"Ignored",
+					"",
+					achBuffer,
+					sizeof(achBuffer));
+		nIgnored = CopyCharacters(achBuffer, achIgnored);
+		GetTwinSockSetting(	"Protocol",
+					"Offset",
+					"64",
+					achBuffer,
+					sizeof(achBuffer));
+		nOffset = atoi(achBuffer);
+	}
+}
+
 void	SendPacket(void	*pvData, int iDataLen, int iStream, int iFlags)
 {
 	struct	packet	*pkt;
 	struct	packet_queue *ppq;
-	short	nCRC;
 
 	if (!iInitialised)
 	{
@@ -474,7 +607,6 @@ void	ProcessData(void *pvData, int nDataLen)
 	static	struct	packet	pkt;
 	static	int	nBytes = 0;
 	int		nToCopy;
-	int		nData;
 	enum packet_type pt;
 	short		iLen;
 	short		nCRC;
@@ -519,7 +651,7 @@ void	ProcessData(void *pvData, int nDataLen)
 				SetTransmitTimeout();
 			return;
 		}
-		if (nBytes < sizeof(short) * 4 + iLen)
+		if (nBytes < ((int) sizeof(short) * 4 + iLen))
 		{
 			nToCopy = sizeof(short) * 4 + iLen - nBytes;
 			if (nDataLen < nToCopy)
@@ -529,7 +661,7 @@ void	ProcessData(void *pvData, int nDataLen)
 			nDataLen -= nToCopy;
 			nBytes += nToCopy;
 		}
-		if (nBytes == sizeof(short) * 4 + iLen)
+		if (nBytes == ((int) sizeof(short) * 4 + iLen))
 		{
 			nBytes = 0;
 			pkt.nCRC = 0;
@@ -555,7 +687,7 @@ void	ProcessData(void *pvData, int nDataLen)
 					break;
 
 				case PT_Shutdown:
-					Shutdown(0);
+					Shutdown();
 					break;
 				}
 			}
@@ -592,9 +724,12 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 	char	cTmp;
 	int	nBitsLeft = 0;
 	int	iOut = 0;
+	int	i;
 	int	nBitsNow;
 	char	*pchDataOut;
 	char	*pchDataIn;
+	int	nBitsCode;
+	int	iHighSet;
 
 	if (!pvData)
 	{
@@ -610,6 +745,11 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 	switch(eLine)
 	{
 	case E_6Bit:
+	case E_8NoHiCtrl:
+		if (eLine == E_6Bit)
+			nBitsCode = 6;
+		else
+			nBitsCode = 7;
 		while (nDataLen || nBitsLeft)
 		{
 			if (nBitsLeft)
@@ -652,6 +792,15 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 				}
 				else
 				{
+					if (cIn & 0x80)
+					{
+						iHighSet = 1;
+						cIn &= 0x7f;
+					}
+					else
+					{
+						iHighSet = 0;
+					}
 					if (cIn >= 'A' && cIn <= 'Z')
 						cIn -= 'A';
 					else if (cIn >= 'a' && cIn <= 'z')
@@ -664,8 +813,49 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 						cIn = 63;
 					else
 						continue;
-					nBitsLeft = 6;
+					if (iHighSet)
+						cIn += 64;
+					nBitsLeft = nBitsCode;
 				}
+			}
+		}
+		break;
+
+	case E_Explicit:
+		while (nDataLen--)
+		{
+			cIn = *pchDataIn++;
+			if (cIn == '\030') /* ^X */
+			{
+				nCtlX++;
+				if (nCtlX >= 5)
+					Shutdown();
+				continue;
+			}
+			else
+			{
+				nCtlX = 0;
+			}
+			for (i = 0; i < nIgnored; i++)
+				if (achIgnored[i] == cIn)
+					break;
+			if (i < nIgnored)
+				continue;
+			if (nBits == 1)
+			{
+				if (cIn == ' ')
+					pchDataOut[iOut++] = '@';
+				else
+					pchDataOut[iOut++] = cIn - nOffset;
+				nBits = 0;
+			}
+			else if (cIn == '@')
+			{
+				nBits = 1;
+			}
+			else
+			{
+				pchDataOut[iOut++] =cIn;
 			}
 		}
 		break;
@@ -673,9 +863,10 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 	case E_8Bit:
 	case E_8NoX:
 	case E_8NoCtrl:
+	case E_8NoHiX:
 		while (nDataLen--)
 		{
-			cIn = *pchDataIn;
+			cIn = *pchDataIn++;
 			if (cIn == '\030') /* ^X */
 			{
 				nCtlX++;
@@ -709,9 +900,8 @@ void	PacketReceiveData(void *pvData, int nDataLen)
 			}
 			else
 			{
-				pchDataOut[iOut++] = *pchDataIn;
+				pchDataOut[iOut++] = cIn;
 			}
-			pchDataIn++;
 		}
 		break;
 	}

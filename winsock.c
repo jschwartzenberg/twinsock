@@ -15,6 +15,7 @@
 #include <winsock.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <dos.h>
 #include "twinsock.h"
 #include "tx.h"
@@ -71,7 +72,7 @@ CopyDataIn(	void		*pvSource,
 
 	case AT_Int32:
 	case AT_Int32Ptr:
-		*(short *) pvDest = ntohl(*(short *) pvSource);
+		*(long *) pvDest = ntohl(*(long *) pvSource);
 		break;
 
 	case AT_Char:
@@ -158,12 +159,23 @@ Notify(struct per_socket *pps,
 		PostMessage(pps->hWnd, pps->wMsg, pps->s, WSAMAKESELECTREPLY(iCode, 0));
 }
 
+static	void
+NotifyError(	struct per_socket *pps,
+		int	iCode,
+		int	iErrno)
+{
+	if (pps->iEvents & iCode)
+		PostMessage(pps->hWnd, pps->wMsg, pps->s, WSAMAKESELECTREPLY(iCode, iErrno));
+}
+
 static	struct	per_socket *
 NewSocket(struct per_task *ppt, SOCKET s)
 {
 	struct per_socket *ppsNew;
 
 	ppsNew = (struct per_socket *) malloc(sizeof(struct per_socket));
+	if (ppsNew == 0)
+		return (ppsNew);
 	ppsNew->s = s;
 	ppsNew->iFlags = 0;
 	ppsNew->pdIn = 0;
@@ -171,6 +183,7 @@ NewSocket(struct per_task *ppt, SOCKET s)
 	ppsNew->htaskOwner = ppt->htask;
 	ppsNew->ppsNext = ppsList;
 	ppsNew->iEvents = 0;
+	ppsNew->nOutstanding = 0;
 	ppsList = ppsNew;
 	return ppsNew;
 	
@@ -232,7 +245,7 @@ RemoveSocket(struct per_socket *pps)
 }
 
 static	void
-DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
+FunctionReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 {
 	struct	data	*pdNew, **ppdList;
 	struct	per_socket *pps, *ppsNew;
@@ -257,6 +270,8 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 	for (ppdList = &pps->pdIn; *ppdList; ppdList = &(*ppdList)->pdNext);
 
 	pdNew = (struct data *) malloc(sizeof(struct data));
+	if (pdNew == 0)
+		return; /* We will get out of sync, but such is life */
 	pdNew->sin = *(struct sockaddr_in *) pvData;
 	pdNew->sin.sin_family = ntohs(pdNew->sin.sin_family);
 
@@ -277,9 +292,9 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 	{
 		pdNew->iLen = 0;
 		if (nLen == sizeof(long))
-			ns = ntohl(*(long *) pvData);
+			ns = (int) ntohl(*(long *) pvData);
 		else
-			ns = ntohs(*(short*) pvData);
+			ns = (int) ntohs(*(short*) pvData);
 		ppt = GetAnotherTaskInfo(pps->htaskOwner);
 		ppsNew = NewSocket(ppt, ns);
 		pdNew->pchData = (char *) ppsNew;
@@ -290,6 +305,11 @@ DataReceived(SOCKET s, void *pvData, int nLen, enum Functions ft)
 	{
 		pdNew->iLen = nLen;
 		pdNew->pchData = (char *) malloc(nLen);
+		if (pdNew->pchData == 0)
+		{
+			pdNew->iLen = 0;	/* Return EOF to the application */
+			return;
+		}
 		memcpy(pdNew->pchData, pvData, nLen);
 		Notify(pps, nLen ? FD_READ : FD_CLOSE);
 	}
@@ -324,7 +344,7 @@ FlushMessages(struct per_task *ppt)
 	BOOL ret;
 
 	if (ppt->lpBlockFunc)
-		return ((BOOL far pascal (*)()) ppt->lpBlockFunc)();
+		return ((BOOL (far pascal *)()) ppt->lpBlockFunc)();
 
  	ret = (BOOL) PeekMessage(&msg,0,0,0,PM_REMOVE);
 	if (ret)
@@ -387,7 +407,7 @@ ResponseReceived(struct tx_request *ptxr)
 	nLen = ntohs(ptxr->nLen);
 	if (ft == FN_Data || ft == FN_Accept)
 	{
-		DataReceived(id, ptxr->pchData, nLen - sizeof(short) * 5, ft);
+		FunctionReceived(id, ptxr->pchData, nLen - sizeof(short) * 5, ft);
 		return;
 	}
 	for (ptxq = ptxqList; ptxq; ptxq = ptxq->ptxqNext)
@@ -399,6 +419,77 @@ ResponseReceived(struct tx_request *ptxr)
 			if (ptxq->pchLocation)
 				FireAsyncRequest(ptxq);
 			return;
+		}
+	}
+	if (ft == FN_SendTo || ft == FN_Send || ft == FN_Connect)
+	{
+		int	iOffset = 0;
+		int	iLen;
+		enum arg_type at;
+		long	nValue;
+		struct	per_socket *pps;
+		int	i;
+		int	nCode;
+
+		switch(ft)
+		{
+		case FN_SendTo:
+		case FN_Send:
+			nCode = 2;
+			break;
+
+		case FN_Connect:
+			nCode = 3;
+			break;
+		}
+
+		for (i = 0; i <= nCode; i++)
+		{
+			at = (enum arg_type) ntohs(*(short *) (ptxr->pchData + iOffset));
+			iOffset += 2;
+			iLen = ntohs(*(short *) (ptxr->pchData + iOffset));
+			iOffset += 2;
+			if (i == 0 || i == nCode)
+			{
+				if (at == AT_Int16)
+					nValue = ntohs(*(short *) (ptxr->pchData + iOffset));
+				else
+					nValue = ntohl(*(long *) (ptxr->pchData + iOffset));
+				if (i == 0)
+				{
+					pps = GetSocketInfo(nValue);
+					if (!pps)
+						return;
+				}
+				else if (ft == FN_Connect)
+				{
+					if (nValue < 0)
+					{
+						NotifyError(pps, FD_CONNECT, ntohs(ptxr->nError));
+					}
+					else
+					{
+						pps->iFlags |= PSF_CONNECT;
+						Notify(pps, FD_CONNECT);
+						Notify(pps, FD_WRITE);
+					}
+				}
+				else
+				{
+					if (nValue < 0)
+					{
+						pps->nOutstanding = 0;
+						NotifyError(pps, FD_WRITE, ntohs(ptxr->nError));
+					}	
+					else
+					{
+						pps->nOutstanding -= nValue;
+						if (pps->nOutstanding < MAX_OUTSTANDING)
+							Notify(pps, FD_WRITE);
+					}
+				}
+			}
+			iOffset += iLen;
 		}
 	}
 }
@@ -416,6 +507,10 @@ TransmitFunction(struct transmit_function *ptf)
 		nSize += ptf->pfaList[i].iLen + sizeof(short) * 2;
 	nSize += ptf->pfaResult->iLen + sizeof(short) * 2;
 	ptxr = (struct tx_request *) malloc(nSize);
+	if (ptxr == 0)
+	{
+		return 0;
+	}
 	ptxr->iType = htons((short) ptf->fn);
 	ptxr->nArgs = htons((short) ptf->nArgs);
 	ptxr->nError = 0;
@@ -445,6 +540,11 @@ TransmitFunction(struct transmit_function *ptf)
 	iOffset += ptf->pfaResult->iLen;
 
 	ptxq = (struct tx_queue *) malloc(sizeof(struct tx_queue));
+	if (ptxq == 0)
+	{
+		free(ptxr);
+		return 0;
+	}
 	ptxq->ptxqNext = 0;
 	ptxq->id = idNext;
 	ptxq->ptxr = ptxr;
@@ -538,9 +638,9 @@ static	int	TransmitFunctionAndBlock(
 	{
 		for (iOffset = i = 0; i < ptf->nArgs; i++)
 		{
-			*(short *) (ptxr->pchData + iOffset) = htons((short) ptf->pfaList[i].at);
+			ptf->pfaList[i].at = (enum arg_type) ntohs(*(short *) (ptxr->pchData + iOffset));
 			iOffset += 2;
-			*(short *) (ptxr->pchData + iOffset) = htons((short) ptf->pfaList[i].iLen);
+			ptf->pfaList[i].iLen = ntohs(*(short *) (ptxr->pchData + iOffset));
 			iOffset += 2;
 			if (!ptf->pfaList[i].bConstant)
 				CopyDataIn(	ptxr->pchData + iOffset,
@@ -549,9 +649,9 @@ static	int	TransmitFunctionAndBlock(
 						ptf->pfaList[i].iLen);
 			iOffset += ptf->pfaList[i].iLen;
 		}
-		*(short *) (ptxr->pchData + iOffset) = htons((short) ptf->pfaResult->at);
+		ptf->pfaResult->at = (enum arg_type) ntohs(*(short *) (ptxr->pchData + iOffset));
 		iOffset += 2;
-		*(short *) (ptxr->pchData + iOffset) = htons((short) ptf->pfaResult->iLen);
+		ptf->pfaResult->iLen = ntohs(*(short *) (ptxr->pchData + iOffset));
 		iOffset += 2;
 		CopyDataIn(	ptxr->pchData + iOffset,
 				ptf->pfaResult->at,
@@ -723,7 +823,6 @@ CopyProtoEnt(struct per_task *ppt)
 static int
 CopyProtoEntTo(struct per_task *ppt, char *pchData)
 {
-	int	iLocation;
 	int	i;
 	int	nAlii;
 	struct	protoent *ppe;
@@ -761,21 +860,22 @@ accept(SOCKET s, struct sockaddr FAR *addr,
 	struct data *pd;
 
 	if ((ppt = GetTaskInfo()) == 0)
-		return -1;
+		return (INVALID_SOCKET);
 	if ((pps = GetSocketInfo(s)) == 0)
-		return -1;
+		return (INVALID_SOCKET);
 	if (!(pps->iFlags & PSF_ACCEPT))
 	{
 		iErrno = WSAEINVAL;
-		return -1;
+		return (INVALID_SOCKET);
 	}
 	if (!pps->pdIn && (pps->iFlags & PSF_NONBLOCK))
 	{
+		FlushMessages(ppt); /* Some apps will call this in a tight loop */
 		iErrno = WSAEWOULDBLOCK;
-		return -1;
+		return (INVALID_SOCKET);
 	}
 	if (!StartBlocking(ppt))
-		return -1;
+		return (INVALID_SOCKET);
 	while (!pps->pdIn)
 	{
 		FlushMessages(ppt);
@@ -783,7 +883,7 @@ accept(SOCKET s, struct sockaddr FAR *addr,
 		{
 			iErrno = WSAEINTR;
 			EndBlocking(ppt);
-			return -1;
+			return (INVALID_SOCKET);
 		}
 	}
 
@@ -818,7 +918,18 @@ bind(SOCKET s, const struct sockaddr FAR *addr, int namelen)
 		return -1;
 	if (!GetSocketInfo(s))
 		return -1;
+	if ((namelen < sizeof(*psa)) || IsBadReadPtr(addr, sizeof(*psa)))
+	{
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
+	namelen = sizeof(*psa);
 	psa = (struct sockaddr *) malloc(namelen);
+	if (psa == 0)
+	{
+		iErrno = WSAENOBUFS;
+		return (SOCKET_ERROR);
+	}
 	memcpy(psa, addr, namelen);
 	psa->sa_family = htons(psa->sa_family);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
@@ -868,7 +979,18 @@ connect(SOCKET s, const struct sockaddr FAR *name, int namelen)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
+	if ((namelen < sizeof(*psa)) || IsBadReadPtr(name, sizeof(*psa)))
+	{
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
+	namelen = sizeof(*psa);
 	psa = (struct sockaddr *) malloc(namelen);
+	if (psa == 0)
+	{
+		iErrno = WSAENOBUFS;
+		return (SOCKET_ERROR);
+	}
 	memcpy(psa, name, namelen);
 	psa->sa_family = htons(psa->sa_family);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
@@ -876,10 +998,19 @@ connect(SOCKET s, const struct sockaddr FAR *name, int namelen)
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&namelen,	sizeof(namelen)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Connect, 3, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
+	if (pps->iEvents & FD_CONNECT)
+	{
+		pps->iFlags |= PSF_CONNECTING;
+		RemoveTXQ(TransmitFunction(&tf));
+		nReturn = 0;
+	}
+	else
+	{
+		TransmitFunctionAndBlock(ppt, &tf);
+		if (nReturn != -1)
+			pps->iFlags |= PSF_CONNECT;
+	}
 	free(psa);
-	if (nReturn != -1)
-		pps->iFlags |= PSF_CONNECT;
 	return nReturn;
 }
 
@@ -888,10 +1019,6 @@ ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 {
 	struct per_task *ppt;
 	struct per_socket *pps;
-	int	nReturn;
-	struct	func_arg pfaArgs[3];
-	struct	func_arg pfaReturn;
-	struct	transmit_function tf;
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return -1;
@@ -900,6 +1027,11 @@ ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 	switch(cmd)
 	{
 	case FIONBIO:
+		if (IsBadReadPtr(arg, sizeof(*arg)))
+		{
+			iErrno = WSAEFAULT;
+			return (SOCKET_ERROR);
+		}
 		if (*arg)
 			pps->iFlags |= PSF_NONBLOCK;
 		else
@@ -907,6 +1039,11 @@ ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 		break;
 
 	case FIONREAD:
+		if (IsBadWritePtr(arg, sizeof(*arg)))
+		{
+			iErrno = WSAEFAULT;
+			return (SOCKET_ERROR);
+		}
 		if (pps->pdIn)
 			*arg = pps->pdIn->iLen - pps->pdIn->nUsed;
 		else
@@ -914,6 +1051,11 @@ ioctlsocket(SOCKET s, long cmd, u_long far * arg)
 		break;
 
 	case SIOCATMARK:
+		if (IsBadWritePtr(arg, sizeof(BOOL)))
+		{
+			iErrno = WSAEFAULT;
+			return (SOCKET_ERROR);
+		}
 		*(BOOL *) arg = 0;
 		break;
 	}
@@ -924,7 +1066,6 @@ int pascal far _export getpeername (SOCKET s, struct sockaddr FAR *name,
                             int FAR * namelen)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[3];
 	struct	func_arg pfaReturn;
@@ -949,7 +1090,6 @@ int pascal far _export getsockname (SOCKET s, struct sockaddr FAR *name,
                             int FAR * namelen)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[3];
 	struct	func_arg pfaReturn;
@@ -975,7 +1115,6 @@ int pascal far _export getsockopt (SOCKET s, int level, int optname,
                            char FAR * optval, int FAR *optlen)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[5];
 	struct	func_arg pfaReturn;
@@ -989,6 +1128,11 @@ int pascal far _export getsockopt (SOCKET s, int level, int optname,
 		return -1;
 	if (!GetSocketInfo(s))
 		return -1;
+	if (level != IPPROTO_TCP && level != (int) SOL_SOCKET)
+	{
+		iErrno = WSAEINVAL;
+		return (SOCKET_ERROR);
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&level,		sizeof(level)		);
 	INIT_ARGS(pfaArgs[2],	AT_Int,		&optname,	sizeof(optname)		);
@@ -1008,7 +1152,7 @@ int pascal far _export getsockopt (SOCKET s, int level, int optname,
 		else
 		{
 			*optlen = sizeof(int);
-			*optval = iOptVal;
+			* (int FAR *) optval = (int) iOptVal;
 		}
 	}
 	return nReturn;
@@ -1045,7 +1189,7 @@ unsigned long pascal far _export inet_addr (const char FAR * cp)
 	char	*pchValue = (char *) &iValue;
 
 	if (!GetTaskInfo())
-		return -1;
+		return (INADDR_NONE);
 	pchValue[0] = atoi(cp);
 	cp = strchr(cp, '.');
 	if (cp)
@@ -1070,7 +1214,7 @@ unsigned long pascal far _export inet_addr (const char FAR * cp)
 			}
 		}
 	}
-	return -1;
+	return (INADDR_NONE);
 }
 
 char FAR * pascal far _export inet_ntoa (struct in_addr in)
@@ -1078,7 +1222,7 @@ char FAR * pascal far _export inet_ntoa (struct in_addr in)
 	struct per_task *ppt;
 
 	if ((ppt = GetTaskInfo()) == 0)
-		return -1;
+		return 0;
 
 	sprintf(ppt->achAddress, "%d.%d.%d.%d",
 			(int) in.S_un.S_un_b.s_b1,
@@ -1175,8 +1319,33 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 	}
 	if (!pps->pdIn && (pps->iFlags & PSF_NONBLOCK))
 	{
+		FlushMessages(ppt); /* Some apps will call this in a tight loop */
 		iErrno = WSAEWOULDBLOCK;
 		return -1;
+	}
+	/*
+	 * Validate the user buffer
+	 */
+	if (IsBadWritePtr(buf, len)) /* Make sure we can write the user data buffer */
+	{
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
+	/*
+	 * If we have a 'from' buffer, make sure that
+	 * we can read and write it. Also make sure that
+	 * the buffer passed is large enough to hold a sockaddr.
+	 */
+	if (from)
+	{
+		if (!fromlen ||				/* Did the user specify a length */
+		    IsBadReadPtr(fromlen, sizeof(*fromlen)) || /* Can we read length ?? */
+		    IsBadWritePtr(fromlen, sizeof(*fromlen)) || /* Can we write it ??    */
+		    (*fromlen < sizeof(struct sockaddr)) ) /* Can it hold a sockaddr? */
+		{
+			iErrno = WSAEFAULT;
+			return (SOCKET_ERROR);
+		}
 	}
 	if (!StartBlocking(ppt))
 		return -1;
@@ -1192,7 +1361,7 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 	}
 
 	pd = pps->pdIn;
-	if (from && fromlen)
+	if (from)
 	{
 		memcpy(from, &pd->sin, sizeof(pd->sin));
 		*fromlen = sizeof(pd->sin);
@@ -1218,18 +1387,20 @@ int pascal far _export recvfrom (SOCKET s, char FAR * buf, int len, int flags,
 	return len;
 }
 
-#define	PPS_ERROR	((struct per_socket *) -1)
+#define	PPS_ERROR	((struct per_socket **) -1)
 
 static	struct	per_socket **
 GetPPS(fd_set *fds)
 {
 	struct per_socket **pps;
-	int	i;
+	u_short	i;
 
 	if (!fds || !fds->fd_count)
 		return 0;
-	pps = (struct per_socket *) malloc(sizeof(struct per_socket *) *
-					fds->fd_count);
+	pps = (struct per_socket **) malloc(sizeof(struct per_socket *) *
+					    fds->fd_count);
+	if (pps == 0)
+		return (pps);
 	for (i = 0; i < fds->fd_count; i++)
 	{
 		pps[i] = GetSocketInfo(fds->fd_array[i]);
@@ -1250,9 +1421,9 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 	struct per_socket **ppsRead, **ppsWrite, **ppsExcept;
 	BOOL	bOneOK = FALSE;
 	BOOL	bTimedOut = FALSE;
-	int	iOld, iNew;
 	unsigned	long	tExpire;
-	int	i;
+	u_short i;
+	u_short	iOld, iNew;
 
 	if (timeout)
 	{
@@ -1285,7 +1456,15 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 	{
 		FlushMessages(ppt);
 		if (ppsWrite)
-			bOneOK = TRUE;
+		{
+			for (i = 0; i < writefds->fd_count; i++)
+			{
+				if (((!ppsWrite[i]->iFlags & PSF_CONNECTING) ||
+				     (ppsWrite[i]->iFlags & PSF_CONNECT)) &&
+				    ppsWrite[i]->nOutstanding < MAX_OUTSTANDING)
+					bOneOK = TRUE;
+			}
+		}
 		if (ppsRead)
 		{
 			for (i = 0; i < readfds->fd_count; i++)
@@ -1313,7 +1492,20 @@ int pascal far _export select (int nfds, fd_set *readfds, fd_set far *writefds,
 		nfds += iNew;
 	}
 	if (writefds)
-		nfds += writefds->fd_count;
+	{
+		for (iOld = iNew = 0; iOld < writefds->fd_count; iOld++)
+		{
+			if (iOld != iNew)
+				writefds->fd_array[iNew] =
+						writefds->fd_array[iOld];
+			if (((!ppsWrite[iOld]->iFlags & PSF_CONNECTING) ||
+				     (ppsWrite[iOld]->iFlags & PSF_CONNECT)) &&
+				    ppsWrite[iOld]->nOutstanding < MAX_OUTSTANDING)
+				iNew++;
+		}
+		writefds->fd_count = iNew;
+		nfds += iNew;
+	}
 	if (exceptfds)
 		exceptfds->fd_count = 0;
 
@@ -1361,6 +1553,13 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
+	if ((pps->iFlags & PSF_CONNECTING) &&
+	    !(pps->iFlags & PSF_CONNECT))
+	{
+		FlushMessages(ppt); /* Some apps will call this in a tight loop */
+		iErrno = WSAEWOULDBLOCK;
+		return -1;
+	}
 	if (!(pps->iFlags & PSF_CONNECT))
 	{
 		iErrno = WSAENOTCONN;
@@ -1371,6 +1570,34 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 		iErrno = WSAECONNRESET;
 		return -1;
 	}
+	if (IsBadReadPtr(buf, len))	/* Is the data buffer readable ? */
+	{
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
+	if (pps->nOutstanding >= MAX_OUTSTANDING)
+	{
+		if (pps->iFlags & PSF_NONBLOCK)
+		{
+			FlushMessages(ppt); /* Some apps will call this in a tight loop */
+			iErrno = WSAEWOULDBLOCK;
+			return -1;
+		}
+		if (!StartBlocking(ppt))
+		{
+			iErrno = WSAEINPROGRESS;
+			return -1;
+		}
+		while (pps->nOutstanding >= MAX_OUTSTANDING && !ppt->bCancel)
+			FlushMessages(ppt);
+		EndBlocking(ppt);
+		if (ppt->bCancel)
+		{
+			ppt->bCancel = FALSE;
+			iErrno = WSAEINTR;
+			return -1;
+		}
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_CARGS(pfaArgs[1],	AT_GenPtr,	buf,		len			);
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&len,		sizeof(len)		);
@@ -1378,7 +1605,9 @@ int pascal far _export send (SOCKET s, const char FAR * buf, int len, int flags)
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_Send, 4, pfaArgs, pfaReturn);
 	RemoveTXQ(TransmitFunction(&tf));
-	Notify(pps, FD_WRITE);
+	pps->nOutstanding += len;
+	if (pps->nOutstanding < MAX_OUTSTANDING)
+		Notify(pps, FD_WRITE);
 	return len;
 }
 
@@ -1397,28 +1626,80 @@ int pascal far _export sendto (SOCKET s, const char FAR * buf, int len, int flag
 		return -1;
 	if ((pps = GetSocketInfo(s)) == 0)
 		return -1;
+	if (pps->nOutstanding >= MAX_OUTSTANDING)
+	{
+		if (pps->iFlags & PSF_NONBLOCK)
+		{
+			FlushMessages(ppt); /* Some apps will call this in a tight loop */
+			iErrno = WSAEWOULDBLOCK;
+			return -1;
+		}
+		if (!StartBlocking(ppt))
+		{
+			iErrno = WSAEINPROGRESS;
+			return -1;
+		}
+		while (pps->nOutstanding >= MAX_OUTSTANDING && !ppt->bCancel)
+			FlushMessages(ppt);
+		EndBlocking(ppt);
+		if (ppt->bCancel)
+		{
+			ppt->bCancel = FALSE;
+			iErrno = WSAEINTR;
+			return -1;
+		}
+	}
 	psa = (struct sockaddr *) malloc(tolen);
+	if (psa == 0)
+	{
+		iErrno = WSAENOBUFS;
+		return (SOCKET_ERROR);
+	}
+	/*
+	 * Sanity check the arguments.
+	 */
+	if ((tolen < sizeof(*psa)) ||
+	    IsBadReadPtr(buf, len) ||
+	    IsBadReadPtr(to, sizeof(*psa)) )
+	{
+		free(psa);
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
+	/*
+	 * The WINSOCK spec allows namelen's that are larger
+	 * then the size of a sockaddr. The WSAT expects sendto()s
+	 * with tolen's > sizeof(struct sockaddr) to succeed.
+	 * Make sure that this condition will not cause the
+	 * other side to fail (we don't know if the other side
+	 * will fail or not with tolen's > sizeof(struct sockaddr).
+	 */
+	tolen = sizeof(*psa);
+
 	memcpy(psa, to, tolen);
 	psa->sa_family = htons(psa->sa_family);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_CARGS(pfaArgs[1],	AT_GenPtr,	buf,		len			);
 	INIT_ARGS(pfaArgs[2],	AT_IntPtr,	&len,		sizeof(len)		);
 	INIT_ARGS(pfaArgs[3],	AT_Int,		&flags,		sizeof(flags)		);
-	INIT_CARGS(pfaArgs[4],	AT_GenPtr,	to,		tolen			);
+	INIT_CARGS(pfaArgs[4],	AT_GenPtr,	psa,		tolen			);
 	INIT_ARGS(pfaArgs[5],	AT_Int,		&tolen,		sizeof(tolen)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
-	INIT_TF(tf, FN_Send, 6, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
+
+	INIT_TF(tf, FN_SendTo, 6, pfaArgs, pfaReturn);
+	RemoveTXQ(TransmitFunction(&tf));
+	pps->nOutstanding += len;
+	if (pps->nOutstanding < MAX_OUTSTANDING)
+		Notify(pps, FD_WRITE);
 	free(psa);
 	Notify(pps, FD_WRITE);
-	return nReturn;
+	return len;
 }
 
 int pascal far _export setsockopt (SOCKET s, int level, int optname,
                            const char FAR * optval, int optlen)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[5];
 	struct	func_arg pfaReturn;
@@ -1432,6 +1713,14 @@ int pascal far _export setsockopt (SOCKET s, int level, int optname,
 		return -1;
 	if (!GetSocketInfo(s))
 		return -1;
+	/*
+	 * Sanity check the arguments.
+	 */
+	if (IsBadReadPtr(optval, optlen))	/* Is the option value readable? */
+	{
+		iErrno = WSAEFAULT;
+		return (SOCKET_ERROR);
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&s,		sizeof(s)		);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&level,		sizeof(level)		);
 	INIT_ARGS(pfaArgs[2],	AT_Int,		&optname,	sizeof(optname)		);
@@ -1447,8 +1736,12 @@ int pascal far _export setsockopt (SOCKET s, int level, int optname,
 	INIT_ARGS(pfaArgs[4],	AT_Int,		&iOptLen,	sizeof(iOptLen)		);
 	INIT_ARGS(pfaReturn,	AT_Int,		&nReturn,	sizeof(nReturn)		);
 	INIT_TF(tf, FN_SetSockOpt, 5, pfaArgs, pfaReturn);
-	TransmitFunctionAndBlock(ppt, &tf);
-	return nReturn;
+	/* If we get this far, assume the host will grok.
+	 * Better to return immediately because applications
+	 * won't expect us to block here.
+	 */
+	RemoveTXQ(TransmitFunction(&tf));
+	return 0;
 }
 
 int pascal far _export shutdown (SOCKET s, int how)
@@ -1477,14 +1770,14 @@ int pascal far _export shutdown (SOCKET s, int how)
 SOCKET pascal far _export socket (int af, int type, int protocol)
 {
 	struct per_task *ppt;
-	struct per_socket *pps;
 	int	nReturn;
 	struct	func_arg pfaArgs[3];
 	struct	func_arg pfaReturn;
 	struct	transmit_function tf;
+	struct	per_socket *pps;
 
 	if ((ppt = GetTaskInfo()) == 0)
-		return -1;
+		return (INVALID_SOCKET);
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&af,		sizeof(af)		);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&type,		sizeof(type)		);
 	INIT_ARGS(pfaArgs[2],	AT_Int,		&protocol,	sizeof(protocol)	);
@@ -1492,7 +1785,22 @@ SOCKET pascal far _export socket (int af, int type, int protocol)
 	INIT_TF(tf, FN_Socket, 3, pfaArgs, pfaReturn);
 	TransmitFunctionAndBlock(ppt, &tf);
 	if (nReturn != -1)
-		NewSocket(ppt, nReturn);
+	{
+		pps = NewSocket(ppt, nReturn);
+		switch(type)
+		{
+		case SOCK_STREAM:
+		case SOCK_SEQPACKET:
+			pps->iFlags |= PSF_MUSTCONN;
+			break;
+
+		case SOCK_DGRAM:
+		case SOCK_RAW:
+		case SOCK_RDM:
+			pps->iFlags &= ~PSF_MUSTCONN;
+			break;
+		}
+	}
 	return nReturn;
 }
 
@@ -1506,6 +1814,19 @@ struct hostent FAR * pascal far _export gethostbyaddr(const char FAR * addr,
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	/*
+	 * Sanity check the arguments. For the first two conditions
+	 * of this check, the WINSOCK spec does not specify the correct
+	 * iErrno value to return if they fail. Here we use EFAULT
+	 * for everything.
+	 */
+	if ((type != PF_INET) ||			/* WINSOCK spec says this must be PF_INET */
+	    (len != 4) ||				/* WINSOCK spec says must be 4 for PF_INET */
+	    IsBadReadPtr(addr, len))			/* Can we read the host address */
+	{
+		iErrno = WSAEFAULT;
+		return 0;
+	}
 	INIT_CARGS(pfaArgs[0],	AT_GenPtr,	addr,		len			);
 	INIT_ARGS(pfaArgs[1],	AT_Int,		&len,		sizeof(len)		);
 	INIT_ARGS(pfaArgs[2],	AT_Int,		&type,		sizeof(type)		);
@@ -1531,6 +1852,14 @@ struct hostent FAR * pascal far _export gethostbyname(const char FAR * name)
 
 	if ((ppt = GetTaskInfo()) == 0)
 		return 0;
+	/*
+	 * Sanity check the argument.
+	 */
+	if (IsBadReadPtr(name, 1))	/* Make sure we can read at least 1 byte */
+	{
+		iErrno = WSAEFAULT;
+		return 0;
+	}
 	INIT_CARGS(pfaArgs[0],	AT_String,	name,		strlen(name) + 1	);
 	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achHostEnt,MAX_HOST_ENT		);
 	INIT_TF(tf, FN_HostByName, 1, pfaArgs, pfaReturn);
@@ -1557,6 +1886,14 @@ struct servent FAR * pascal far _export getservbyport(int port, const char FAR *
 	PORTSWAP(port);
 	if (!proto)
 		proto = "";
+	/*
+	 * Sanity check the argumets.
+	 */
+	else if (IsBadReadPtr(proto, 1))	/* Make sure we can read at least 1 byte */
+	{
+    		iErrno = WSAEFAULT;
+    		return 0;
+	}
 	INIT_ARGS(pfaArgs[0],	AT_Int,		&port,		sizeof(port)		);
 	INIT_CARGS(pfaArgs[1],	AT_String,	proto,		strlen(proto) + 1	);
 	INIT_ARGS(pfaReturn,	AT_GenPtr,	ppt->achServEnt,MAX_HOST_ENT		);
@@ -1671,8 +2008,8 @@ int pascal far _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
 	lpWSAData->wVersion = 0x0101;
 	lpWSAData->wHighVersion = 0x0101;
 	strcpy(lpWSAData->szDescription,
-		"TwinSock 1.3 - Proxy sockets system. "
-		"Copyright 1994 Troy Rollo. "
+		"TwinSock 1.4 - Proxy sockets system. "
+		"Copyright 1994-1995 Troy Rollo. "
 		"TwinSock is free software. "
 		"See the file \"COPYING\" from the "
 		"distribution for details.");
@@ -1690,6 +2027,8 @@ int pascal far _export WSAStartup(WORD wVersionRequired, LPWSADATA lpWSAData)
 	if (!bEstablished)
 		return WSASYSNOTREADY;
 	pptNew = malloc(sizeof(struct per_task));
+	if (pptNew == 0)
+		return (WSAENOBUFS);
 	pptNew->htask = GetCurrentTask();
 	pptNew->pptNext = pptList;
 	pptNew->lpBlockFunc = 0;
@@ -1717,7 +2056,7 @@ int pascal far _export WSACleanup(void)
 void pascal far _export WSASetLastError(int iError)
 {
 	if (!GetTaskInfo())
-		return -1;
+		return;
 	iErrno = iError;
 }
 
@@ -1748,11 +2087,14 @@ int pascal far _export WSAUnhookBlockingHook(void)
 FARPROC pascal far _export WSASetBlockingHook(FARPROC lpBlockFunc)
 {
 	struct per_task *ppt;
-
+	FARPROC oldfunc;
+	
 	if ((ppt = GetTaskInfo()) == 0)
-		return -1;
+		return 0;
+	oldfunc = ppt->lpBlockFunc;
 	ppt->lpBlockFunc = lpBlockFunc;
-	return -1;
+
+	return (oldfunc);	/* Return the previous value */
 }
 
 int pascal far _export WSACancelBlockingCall(void)
@@ -2016,7 +2358,9 @@ int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
 	pps->hWnd = hWnd;
 	pps->wMsg = wMsg;
 	pps->iEvents = lEvent;
-	Notify(pps, FD_WRITE);
+	if (!(pps->iFlags & PSF_MUSTCONN) ||
+	    (pps->iFlags & PSF_CONNECT))
+		Notify(pps, FD_WRITE);
 	if (pps->pdIn)
 		Notify(pps, (pps->iFlags & PSF_ACCEPT) ?
 				FD_ACCEPT :
@@ -2028,7 +2372,7 @@ int pascal far _export WSAAsyncSelect(SOCKET s, HWND hWnd, u_int wMsg,
 
 int FAR PASCAL _export __WSAFDIsSet(SOCKET s, fd_set FAR *pfds)
 {
-	int	i;
+	u_short	i;
 
 	if (!GetTaskInfo())
 		return -1;

@@ -16,7 +16,13 @@ void InitTerm(void)
 
 	New=Old;                                /*in case nonstandard fields*/
 
-	New.c_iflag = IXOFF|IXON;               /*raw except for flow control*/
+	/* This did have XON/XOFF flow control set.
+	 * This is genrally a bad idea when using a complex protocol - a character
+	 * might get corrupted to XOFF, at which point you must reset the application,
+	 * because the host hend won't respond until it gets an XON.
+	 */
+	New.c_iflag = 0;
+
 	New.c_oflag = 0;
 	New.c_cflag = CREAD|CS8|HUPCL;
 	New.c_lflag = 0;
@@ -46,4 +52,3 @@ void UnInitTerm(void)
 }
 
 
-

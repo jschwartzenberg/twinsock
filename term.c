@@ -77,4 +77,3 @@ void	UnInitTerm(void)
 {
 	ioctl(0, TIOCSETP, &Old);
 }
-

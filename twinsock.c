@@ -33,6 +33,7 @@ extern	int	iPortChanged;
 #define	TIMER_ID_RECEIVE	2
 #define	TIMER_ID_FLUSH		3
 #define	TIMER_ID_BREAK		4
+#define TIMER_ID_COMMCHECK	5
 
 static	int	idComm;
 static	HWND	hwnd;
@@ -86,8 +87,9 @@ void	FlushInput(void)
 }
 
 static	void
-AddChar(char c)
+SendToScreen(char c)
 {
+
 	RECT	rcClient;
 	RECT	rcRedraw;
 
@@ -128,6 +130,12 @@ AddChar(char c)
 		if (iColumn < SCREEN_COLUMNS - 1)
 			iColumn++;
 	}
+}
+
+static	void
+AddChar(char c)
+{
+	SendToScreen(c);
 	if (c == achProtoInit[iInitChar])
 	{
 		iInitChar++;
@@ -136,6 +144,7 @@ AddChar(char c)
 			iInitChar = 0;
 			bTerminal = 0;
 			RegisterManager(hwnd);
+			InitProtocol();
 			SendInitRequest();
 		}
 	}
@@ -337,7 +346,7 @@ WindowProc(	HWND	hWnd,
 		switch(wParam)
 		{
 		case TIMER_ID_SEND:
-			TimeoutReceived(TIMER_ID_SEND);
+			TimeoutReceived();
 			break;
 
 		case TIMER_ID_RECEIVE:
@@ -354,6 +363,10 @@ WindowProc(	HWND	hWnd,
 			ClearCommBreak(idComm);
 			KillTimer(hWnd, TIMER_ID_BREAK);
 			break;
+
+ 		case TIMER_ID_COMMCHECK:
+ 			DoReading();
+ 			break;
 		}
 		break;
 
@@ -393,6 +406,7 @@ DataReceived(void *pvData, int iLen)
 	short	nPktLen;
 	enum Functions ft;
 	int	nCopy;
+	int	i;
 
 	while (iLen)
 	{
@@ -436,6 +450,13 @@ DataReceived(void *pvData, int iLen)
 						CloseWindow(hwnd);
 						SetInitialised();
 					}
+				}
+				else if (ft == FN_Message)
+				{
+					SendToScreen('\r');
+					SendToScreen('\n');
+					for (i = 0; i < nPktLen - 10; i++)
+						SendToScreen(ptxr->pchData[i]);
 				}
 				else
 				{
@@ -538,6 +559,7 @@ OpenPort(void)
 
 	InitComm(idComm);
 	EnableCommNotification(idComm, hwnd, 1, 0);
+ 	SetTimer(hwnd, TIMER_ID_COMMCHECK, 1000, 0);
 }
 
 #pragma argsused

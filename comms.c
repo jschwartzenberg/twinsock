@@ -13,6 +13,8 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
+#include "twinsock.h"
 
 extern	HINSTANCE	hinst;
 int	iPortChanged = 0;
@@ -24,13 +26,20 @@ GetConfigInt(char const *pchItem, UINT nDefault)
 	return GetPrivateProfileInt("Config", pchItem, nDefault, "TWINSOCK.INI");
 }
 
+enum LineSpeed { B110, B300, B600, B1200, B2400, B4800, B9600,
+		 B14400, B19200, B38400, B56000, B128000, B256000,
+		 BBOGUS };
+unsigned GetSpeedIndex(enum LineSpeed lsSpeed);
+
 void
 InitComm(int	idComm)
 {
 	DCB	dcb;
+	unsigned speed;
 
 	dcb.Id = idComm;
-	dcb.BaudRate = GetConfigInt("Speed", 19200);
+	speed = GetConfigInt("Speed", B19200);
+	dcb.BaudRate = GetSpeedIndex((enum LineSpeed) speed);
 	dcb.ByteSize = GetConfigInt("Databits", 8);
 	dcb.Parity = GetConfigInt("Parity", NOPARITY);
 	dcb.StopBits = GetConfigInt("StopBits", ONESTOPBIT);
@@ -66,25 +75,42 @@ InitComm(int	idComm)
 
 static	struct
 {
-	unsigned iValue;
-	long	iSpeed;
+    unsigned		iValue;
+    char	       *strSpeed;
+    enum LineSpeed	lsSpeed;
 } aSpeeds[] =
 {
-	{ CBR_110,	110	},
-	{ CBR_300,	300	},
-	{ CBR_600,	600	},
-	{ CBR_1200,	1200	},
-	{ CBR_2400,	2400	},
-	{ CBR_4800,	4800	},
-	{ CBR_9600,	9600	},
-	{ CBR_14400,	14400	},
-	{ CBR_19200,	19200	},
-	{ CBR_38400,	38400	},
-	{ CBR_56000,	56000	},
-	{ CBR_128000,	128000	},
-	{ CBR_256000,	2256000	},
-	{ 0,		-1	},
+	{ CBR_110,	"110",	B110	},
+	{ CBR_300,	"300",	B300	},
+	{ CBR_600,	"600",	B600	},
+	{ CBR_1200,	"1200",	B1200	},
+	{ CBR_2400,	"2400",	B2400	},
+	{ CBR_4800,	"4800",	B4800	},
+	{ CBR_9600,	"9600",	B9600	},
+	{ CBR_14400,	"14400",B14400	},
+	{ CBR_19200,	"19200",B19200	},
+	{ CBR_38400,	"38400",B38400	},
+	{ CBR_56000,	"57600",B56000	},
+	{ CBR_128000,	"128000",B128000},
+	{ CBR_256000,	"256000",B256000},
+	{ 0,		"BOGUS",BBOGUS	},
 };
+
+/*
+ * Returns the appropriate port speed index value
+ * necessary to setup the COM port
+ */
+unsigned GetSpeedIndex(enum LineSpeed lsSpeed)
+{
+	int i;
+    
+	for (i = 0; aSpeeds[i].lsSpeed != BBOGUS; ++i)
+	{
+		if (lsSpeed == aSpeeds[i].lsSpeed)
+		break;
+	}
+	return (aSpeeds[i].iValue);
+}
 
 static	char	*apchPorts[] =
 {
@@ -131,16 +157,13 @@ FillCommsDialog(HWND hDlg)
 	strcpy(achStartPort, achTmp);
 	for (i = 0; apchPorts[i]; i++)
 		SendDlgItemMessage(hDlg, CE_PORT, CB_ADDSTRING, 0, (LPARAM) apchPorts[i]);
-	iSpeedNow = GetPrivateProfileInt("Config", "Speed", 19200, "TWINSOCK.INI");
-	for (i = 0; aSpeeds[i].iSpeed != -1; i++)
+	iSpeedNow = GetPrivateProfileInt("Config", "Speed", (int) B19200, "TWINSOCK.INI");
+	for (i = 0; aSpeeds[i].lsSpeed != BBOGUS; ++i)
 	{
-		sprintf(achTmp, "%ld", aSpeeds[i].iSpeed);
+		sprintf(achTmp, "%s", aSpeeds[i].strSpeed);	
 		SendDlgItemMessage(hDlg, CE_SPEED, CB_ADDSTRING, 0, (LPARAM) achTmp);
-		if (aSpeeds[i].iSpeed == iSpeedNow ||
-		    aSpeeds[i].iValue == iSpeedNow)
-		{
+		if (aSpeeds[i].lsSpeed == iSpeedNow)
 			SendDlgItemMessage(hDlg, CE_SPEED, CB_SETCURSEL, i, 0);
-		}
 	}
 
 	for (i = 5; i <= 8; i++)
@@ -165,7 +188,7 @@ FillCommsDialog(HWND hDlg)
 void
 ReadCommsDialog(HWND hDlg)
 {
-	int	i;
+	LRESULT	i;
 	char	achTemp[100];
 
 	GetDlgItemText(hDlg, CE_PORT, achTemp, 100);
@@ -174,7 +197,7 @@ ReadCommsDialog(HWND hDlg)
 		iPortChanged = 1;
 
 	i = SendDlgItemMessage(hDlg, CE_SPEED, CB_GETCURSEL, 0, 0);
-	i = aSpeeds[i].iValue;
+	i = aSpeeds[i].lsSpeed;
 	sprintf(achTemp, "%d", i);
 	WritePrivateProfileString("Config", "Speed", achTemp, "TWINSOCK.INI");
 
@@ -247,8 +270,8 @@ DialDlgProc(	HWND	hDlg,
 		WPARAM	wParam,
 		LPARAM	lParam)
 {
+	char	achNumber[84];
 	int	iMethod;
-	char	achNumber[80];
 
 	switch(wMsg)
 	{
@@ -265,14 +288,14 @@ DialDlgProc(	HWND	hDlg,
 		switch(wParam)
 		{
 		case IDOK:
-			GetDlgItemText(hDlg, DL_NUMBER, achNumber, 80);
-			WritePrivateProfileString("Config", "LastNumber", achNumber, "TWINSOCK.INI");
+			GetDlgItemText(hDlg, DL_NUMBER, achNumber + 4, 76);
+			WritePrivateProfileString("Config", "LastNumber", achNumber + 4, "TWINSOCK.INI");
 			iMethod = SendMessage(GetDlgItem(hDlg, DL_TONE), BM_GETCHECK, 0, 0);
 			WritePrivateProfileString("Config", "DialingMethod", iMethod ? "1" : "0", "TWINSOCK.INI");
 			EndDialog(hDlg, TRUE);
-			SendData(iMethod ? "ATDT" : "ATDP", 4);
+			strncpy(achNumber, iMethod ? "ATDT" : "ATDP", 4);
+			strcat(achNumber, "\r");
 			SendData(achNumber, strlen(achNumber));
-			SendData("\r", 1);
 			break;
 
 		case IDCANCEL:
